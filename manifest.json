@@ -1,0 +1,276 @@
+{
+  "tools": [
+    {
+      "name": "google_list_files",
+      "description": "List files and subfolders in the configured Google Drive project folder or one of its descendant folders. Sharing and permission settings cannot be changed by agents.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "parent_id": {
+            "type": "string",
+            "description": "Optional Google Drive folder ID. It must be the configured root folder or a descendant. Omit to list the project root folder."
+          },
+          "page_size": {
+            "type": "integer",
+            "description": "Maximum number of files to return, from 1 to 100."
+          }
+        }
+      },
+      "annotations": {
+        "read_only_hint": true,
+        "destructive_hint": false,
+        "idempotent_hint": true
+      }
+    },
+    {
+      "name": "google_search_files",
+      "description": "Search file and folder names recursively within the configured Google Drive project folder.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Text contained in the file or folder name."
+          },
+          "mime_type": {
+            "type": "string",
+            "description": "Optional exact Google Drive MIME type filter."
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "Maximum number of results, from 1 to 100."
+          }
+        },
+        "required": ["query"]
+      },
+      "annotations": {
+        "read_only_hint": true,
+        "destructive_hint": false,
+        "idempotent_hint": true
+      }
+    },
+    {
+      "name": "google_read_file",
+      "description": "Read the content of a non-folder file inside the configured Google Drive project folder. Google Docs are returned as structured text; binary files are returned as bounded base64 content.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file_id": {
+            "type": "string",
+            "description": "Google Drive file ID inside the configured project folder."
+          }
+        },
+        "required": ["file_id"]
+      },
+      "annotations": {
+        "read_only_hint": true,
+        "destructive_hint": false,
+        "idempotent_hint": true
+      }
+    },
+    {
+      "name": "google_read_document",
+      "description": "Read the text and current revision of a Google Docs document inside the configured project folder.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file_id": {
+            "type": "string",
+            "description": "Google Drive file ID of a Google Docs document inside the configured project folder."
+          }
+        },
+        "required": ["file_id"]
+      },
+      "annotations": {
+        "read_only_hint": true,
+        "destructive_hint": false,
+        "idempotent_hint": true
+      }
+    },
+    {
+      "name": "google_create_folder",
+      "description": "Create a subfolder inside the configured Google Drive project folder or one of its descendant folders.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Name of the new folder."
+          },
+          "parent_id": {
+            "type": "string",
+            "description": "Optional descendant folder ID. Omit to create the folder in the project root."
+          }
+        },
+        "required": ["name"]
+      },
+      "annotations": {
+        "read_only_hint": false,
+        "destructive_hint": false,
+        "idempotent_hint": false
+      }
+    },
+    {
+      "name": "google_create_document",
+      "description": "Create a Google Docs document inside the configured Google Drive project folder or a descendant folder.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Name of the new Google Docs document."
+          },
+          "parent_id": {
+            "type": "string",
+            "description": "Optional descendant folder ID. Omit to create the document in the project root."
+          },
+          "initial_text": {
+            "type": "string",
+            "description": "Optional initial text to insert into the new document."
+          }
+        },
+        "required": ["name"]
+      },
+      "annotations": {
+        "read_only_hint": false,
+        "destructive_hint": false,
+        "idempotent_hint": false
+      }
+    },
+    {
+      "name": "google_create_document_from_template",
+      "description": "Copy a Google Docs template that is inside the configured project folder into the project folder or a descendant folder.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "template_file_id": {
+            "type": "string",
+            "description": "Google Drive file ID of a Google Docs template inside the configured project folder."
+          },
+          "name": {
+            "type": "string",
+            "description": "Name of the new document."
+          },
+          "parent_id": {
+            "type": "string",
+            "description": "Optional descendant folder ID. Omit to create the document in the project root."
+          }
+        },
+        "required": ["template_file_id", "name"]
+      },
+      "annotations": {
+        "read_only_hint": false,
+        "destructive_hint": false,
+        "idempotent_hint": false
+      }
+    },
+    {
+      "name": "google_update_document",
+      "description": "Apply Google Docs batch update operations to a document inside the configured project folder. Provide the revision ID from google_read_document to reject stale edits.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file_id": {
+            "type": "string",
+            "description": "Google Drive file ID of the document to update."
+          },
+          "requests": {
+            "type": "array",
+            "description": "One or more Google Docs API request objects, each containing exactly one operation."
+          },
+          "required_revision_id": {
+            "type": "string",
+            "description": "Revision ID returned by google_read_document. The update is rejected if the document changed since it was read."
+          }
+        },
+        "required": ["file_id", "requests"]
+      },
+      "annotations": {
+        "read_only_hint": false,
+        "destructive_hint": false,
+        "idempotent_hint": false
+      }
+    },
+    {
+      "name": "google_move_file",
+      "description": "Move a file or subfolder to another folder inside the configured Google Drive project folder. It cannot move anything outside the project folder.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file_id": {
+            "type": "string",
+            "description": "Google Drive file or folder ID to move."
+          },
+          "parent_id": {
+            "type": "string",
+            "description": "Destination folder ID inside the configured project folder."
+          }
+        },
+        "required": ["file_id", "parent_id"]
+      },
+      "annotations": {
+        "read_only_hint": false,
+        "destructive_hint": false,
+        "idempotent_hint": false
+      }
+    },
+    {
+      "name": "google_delete_file",
+      "description": "Delete a file or descendant subfolder inside the configured Google Drive project folder. The root folder cannot be deleted. Sharing and permission settings are not changed.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file_id": {
+            "type": "string",
+            "description": "Google Drive file or descendant folder ID to delete."
+          }
+        },
+        "required": ["file_id"]
+      },
+      "annotations": {
+        "read_only_hint": false,
+        "destructive_hint": true,
+        "idempotent_hint": true
+      }
+    },
+    {
+      "name": "google_export_file",
+      "description": "Export a Google Docs document inside the configured project folder as base64-encoded content, for example DOCX or PDF.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file_id": {
+            "type": "string",
+            "description": "Google Drive file ID of the document to export."
+          },
+          "mime_type": {
+            "type": "string",
+            "description": "Export MIME type. Defaults to DOCX."
+          }
+        },
+        "required": ["file_id"]
+      },
+      "annotations": {
+        "read_only_hint": true,
+        "destructive_hint": false,
+        "idempotent_hint": true
+      }
+    }
+  ],
+  "oauth": {
+    "required": true,
+    "provider": "google"
+  },
+  "configuration": {
+    "root_folder_id": {
+      "label": "Google Drive project folder ID or URL",
+      "type": "text",
+      "description": "Agents can manage files and subfolders in this folder only. Sharing and permissions remain human-only.",
+      "placeholder": "https://drive.google.com/drive/folders/..."
+    }
+  },
+  "runtime": {
+    "port": 8080,
+    "health_check": "/health"
+  }
+}
