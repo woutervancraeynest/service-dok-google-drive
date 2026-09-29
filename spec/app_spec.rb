@@ -34,5 +34,31 @@ RSpec.describe DokService do
       expect(last_response.status).to eq(200)
       expect(JSON.parse(last_response.body)["total"]).to eq(0)
     end
+
+    it "dispatches google_append_table_row" do
+      client = instance_double(GoogleWorkspace::Client)
+      allow(GoogleWorkspace::Client).to receive(:from_context).and_return(client)
+      allow(client).to receive(:append_table_row).and_return({ status: "inserted", file_id: "doc1" })
+
+      call_tool("google_append_table_row", params: {
+        "file_id" => "doc1",
+        "table_selector" => { "header_cells" => ["Datum", "Inhoud", "To do"] },
+        "cells" => ["11/09/2026", "Content", "Todo"]
+      })
+
+      expect(last_response.status).to eq(200)
+      expect(JSON.parse(last_response.body)["status"]).to eq("inserted")
+    end
+
+    it "dispatches google_analyze_document_tables" do
+      client = instance_double(GoogleWorkspace::Client)
+      allow(GoogleWorkspace::Client).to receive(:from_context).and_return(client)
+      allow(client).to receive(:analyze_document_tables).and_return({ id: "doc1", tabs: [] })
+
+      call_tool("google_analyze_document_tables", params: { "file_id" => "doc1" })
+
+      expect(last_response.status).to eq(200)
+      expect(JSON.parse(last_response.body)["id"]).to eq("doc1")
+    end
   end
 end

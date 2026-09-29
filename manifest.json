@@ -255,6 +255,101 @@
         "destructive_hint": false,
         "idempotent_hint": true
       }
+    },
+    {
+      "name": "google_append_table_row",
+      "description": "Append a row to a table inside a Google Docs document. The tool finds the table by its header cells, computes all structural indices, optionally deduplicates, and verifies the result. The agent provides only cell values; the tool handles all Docs API index calculations.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file_id": {
+            "type": "string",
+            "description": "Google Drive file ID of the Google Docs document."
+          },
+          "table_selector": {
+            "type": "object",
+            "description": "Selector to identify the target table.",
+            "properties": {
+              "header_cells": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Ordered list of column header texts to match the table's first row."
+              }
+            },
+            "required": ["header_cells"]
+          },
+          "cells": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Cell values for the new row, one per column, in column order."
+          },
+          "dedup": {
+            "type": "object",
+            "description": "Optional deduplication. When set, the tool checks whether a row with the same value already exists before writing.",
+            "properties": {
+              "column_index": {
+                "type": "integer",
+                "description": "Zero-based column index to compare. Default 0."
+              },
+              "match": {
+                "type": "string",
+                "enum": ["date", "exact", "none"],
+                "description": "Match mode: 'date' normalises dd/mm/yyyy before comparing, 'exact' compares trimmed text literally, 'none' disables dedup."
+              }
+            },
+            "required": ["match"]
+          },
+          "use_placeholder_row": {
+            "type": "boolean",
+            "description": "When true (default), fill an existing empty or <token> placeholder row instead of inserting a new one."
+          },
+          "required_revision_id": {
+            "type": "string",
+            "description": "Revision ID from google_read_document. The operation is rejected if the document changed since it was read."
+          },
+          "dry_run": {
+            "type": "boolean",
+            "description": "When true, check preconditions and return the planned status without writing. Default false."
+          }
+        },
+        "required": ["file_id", "table_selector", "cells"]
+      },
+      "annotations": {
+        "read_only_hint": false,
+        "destructive_hint": false,
+        "idempotent_hint": true
+      }
+    },
+    {
+      "name": "google_analyze_document_tables",
+      "description": "Analyze the table structure of a Google Docs document. Returns tables, rows, text blocks outside tables, and detected date patterns. Use this to inspect a document before appending or repairing table content.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file_id": {
+            "type": "string",
+            "description": "Google Drive file ID of the Google Docs document."
+          },
+          "table_selector": {
+            "type": "object",
+            "description": "Optional selector to identify a specific table.",
+            "properties": {
+              "header_cells": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Ordered list of column header texts to match the table's first row."
+              }
+            },
+            "required": ["header_cells"]
+          }
+        },
+        "required": ["file_id"]
+      },
+      "annotations": {
+        "read_only_hint": true,
+        "destructive_hint": false,
+        "idempotent_hint": true
+      }
     }
   ],
   "oauth": {

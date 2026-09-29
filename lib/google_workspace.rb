@@ -5,6 +5,7 @@ require "google/apis/docs_v1"
 require "stringio"
 require "time"
 require "uri"
+require_relative "doc_tables"
 
 module GoogleWorkspace
   # C1: drive.file only covers files the app created or user selected via Picker.
@@ -20,6 +21,7 @@ module GoogleWorkspace
   MAX_EXPORT_BYTES = 5 * 1024 * 1024
   MAX_SEARCH_FOLDERS = 50
   MAX_RETRIES = 2
+  MAX_APPEND_ATTEMPTS = 2
   FILE_FIELDS = "id,name,mimeType,parents,trashed,webViewLink,modifiedTime,size,shortcutDetails(targetId,targetMimeType),driveId".freeze
 
   class Error < StandardError; end
@@ -27,6 +29,7 @@ module GoogleWorkspace
   class AuthenticationError < Error; end
   class ScopeError < Error; end
   class ApiError < Error; end
+  class RevisionConflictError < Error; end
 
   class Client
     attr_reader :root_folder_id
@@ -310,6 +313,184 @@ module GoogleWorkspace
       }
     end
 
+    # ── Table operations ──────────────────────────────────────────────
+
+    def append_table_row(file_id:, header_cells:, cells:, dedup: nil,
+                         use_placeholder_row: true, required_revision_id: nil, dry_run: false)
+      file = resolve_file_in_scope!(file_id)
+      unless file.mime_type == DOCUMENT_MIME_TYPE
+        raise ConfigurationError, "Only Google Docs documents support table operations."
+      end
+
+      # 1. Read the full structural document
+      doc0 = get_structured_document(file.id)
+      rev0 = doc0.revision_id
+      parsed0 = DocTables.parse(doc0)
+
+      # 2. Revision guard — the agent's last-known revision must match
+      if !required_revision_id.to_s.strip.empty? && required_revision_id.to_s.strip != rev0
+        match = DocTables.find_table(parsed0, header_cells)
+        if match && dedup_match?(match[:table], dedup, cells)
+          return append_result(status: "duplicate", file: file, revision_id: rev0, cells: cells, dedup: dedup)
+        end
+        return append_result(status: "revision_conflict", file: file, revision_id: rev0, cells: cells, dedup: dedup)
+      end
+
+      # 3. Find the target table by header cells
+      table_match = DocTables.find_table(parsed0, header_cells)
+      unless table_match
+        return append_result(status: "table_not_found", file: file, revision_id: rev0, cells: cells, dedup: dedup)
+      end
+      tab_id = table_match[:tab_id]
+      table0 = table_match[:table]
+
+      # 4. Duplicate check
+      if dedup_match?(table0, dedup, cells)
+        return append_result(status: "duplicate", file: file, revision_id: rev0, cells: cells, dedup: dedup)
+      end
+
+      # 5. Determine path: placeholder fill or row insert
+      placeholder_idx = use_placeholder_row ? DocTables.placeholder_row_index(table0) : nil
+      target_row_index = placeholder_idx || table0[:rows].length
+
+      # 6. Dry run — report what would happen, no writes
+      if dry_run
+        return append_result(
+          status: "inserted", file: file, revision_id: rev0, cells: cells, dedup: dedup,
+          table_row_index: target_row_index, dry_run: true
+        )
+      end
+
+      values = cells.map(&:to_s)
+
+      if placeholder_idx
+        # ── Placeholder fill ─────────────────────────────────────────
+        row = table0[:rows][placeholder_idx]
+        if row[:cells].length < values.length
+          return append_result(status: "malformed_table", file: file, revision_id: rev0, cells: cells, dedup: dedup,
+                               warnings: ["Placeholder row has #{row[:cells].length} cells, expected #{values.length}."])
+        end
+
+        requests = build_cell_fill_requests(tab_id, row[:cells], values)
+        batch = build_guarded_batch(requests, rev0)
+        begin
+          guarded_batch_update(file.id, batch)
+        rescue RevisionConflictError
+          return append_result(status: "revision_conflict", file: file, revision_id: rev0, cells: cells, dedup: dedup)
+        end
+      else
+        # ── Insert new row ───────────────────────────────────────────
+        last_row_index = table0[:rows].length - 1
+        rev = rev0
+        current_table = table0
+        attempts = 0
+
+        loop do
+          insert_req = build_insert_row_request(tab_id, current_table[:start_index], last_row_index)
+          batch = build_guarded_batch([insert_req], rev)
+          begin
+            guarded_batch_update(file.id, batch)
+            break
+          rescue RevisionConflictError
+            attempts += 1
+            if attempts >= MAX_APPEND_ATTEMPTS
+              return append_result(status: "revision_conflict", file: file, revision_id: rev, cells: cells, dedup: dedup)
+            end
+            doc_retry = get_structured_document(file.id)
+            rev = doc_retry.revision_id
+            parsed_retry = DocTables.parse(doc_retry)
+            retry_match = DocTables.find_table(parsed_retry, header_cells)
+            unless retry_match
+              return append_result(status: "table_not_found", file: file, revision_id: rev, cells: cells, dedup: dedup)
+            end
+            if dedup_match?(retry_match[:table], dedup, cells)
+              return append_result(status: "duplicate", file: file, revision_id: rev, cells: cells, dedup: dedup)
+            end
+            current_table = retry_match[:table]
+            last_row_index = current_table[:rows].length - 1
+          end
+        end
+
+        # Re-read after row insert — indices have changed
+        doc1 = get_structured_document(file.id)
+        rev1 = doc1.revision_id
+        parsed1 = DocTables.parse(doc1)
+        match1 = DocTables.find_table(parsed1, header_cells)
+        unless match1
+          return append_result(status: "partial_failure", file: file, revision_id: rev1, cells: cells, dedup: dedup,
+                               warnings: ["Row inserted but table not found for cell fill."])
+        end
+        new_row = match1[:table][:rows].last
+        if new_row[:cells].length < values.length
+          return append_result(status: "partial_failure", file: file, revision_id: rev1, cells: cells, dedup: dedup,
+                               warnings: ["New row has #{new_row[:cells].length} cells, expected #{values.length}."])
+        end
+
+        # Fill cells
+        fill_reqs = build_cell_fill_requests(tab_id, new_row[:cells], values, clear: false)
+        fill_batch = build_guarded_batch(fill_reqs, rev1)
+        begin
+          guarded_batch_update(file.id, fill_batch)
+        rescue RevisionConflictError, ApiError => e
+          return append_result(status: "partial_failure", file: file, revision_id: rev1, cells: cells, dedup: dedup,
+                               warnings: ["Row inserted but cell fill failed: #{e.message}"])
+        end
+      end
+
+      # 7. Verify the final state
+      doc_final = get_structured_document(file.id)
+      rev_final = doc_final.revision_id
+      parsed_final = DocTables.parse(doc_final)
+      match_final = DocTables.find_table(parsed_final, header_cells)
+
+      unless match_final
+        return append_result(status: "partial_failure", file: file, revision_id: rev_final, cells: cells, dedup: dedup,
+                             warnings: ["Write succeeded but table not found during verification."])
+      end
+
+      tab_before = parsed0.find { |t| t[:tab_id] == tab_id }
+      tab_after = parsed_final.find { |t| t[:tab_id] == tab_id }
+      v = DocTables.verify(tab_before, tab_after, table0, match_final[:table], cells, dedup: dedup)
+
+      append_result(
+        status: "inserted", file: file, revision_id: rev_final, cells: cells, dedup: dedup,
+        table_row_index: target_row_index, verification: v[:verification], warnings: v[:warnings]
+      )
+    end
+
+    def analyze_document_tables(file_id:, header_cells: nil)
+      file = resolve_file_in_scope!(file_id)
+      unless file.mime_type == DOCUMENT_MIME_TYPE
+        raise ConfigurationError, "Only Google Docs documents can be analyzed."
+      end
+
+      doc = get_structured_document(file.id)
+      parsed = DocTables.parse(doc)
+
+      analysis = {
+        id: file.id,
+        name: file.name,
+        revision_id: doc.revision_id,
+        tabs: parsed.map { |tab| serialize_tab_analysis(tab) }
+      }
+
+      if header_cells.is_a?(Array) && header_cells.any?
+        match = DocTables.find_table(parsed, header_cells)
+        if match
+          analysis[:matched_table] = {
+            tab_id: match[:tab_id],
+            start_index: match[:table][:start_index],
+            rows: serialize_table_rows(match[:table])
+          }
+        else
+          analysis[:matched_table] = nil
+          analysis[:warnings] = ["No table found matching the given header cells."]
+        end
+      end
+
+      analysis
+    end
+
     private
 
     def read_document_internal(file)
@@ -521,6 +702,140 @@ module GoogleWorkspace
       raise AuthenticationError
     rescue Google::Apis::ClientError => e
       raise ApiError, "Google API request failed (#{e.status_code})."
+    end
+
+    # ── Structured document access ──────────────────────────────────
+
+    def get_structured_document(file_id)
+      api_call { @docs.get_document(file_id, include_tabs_content: true) }
+    end
+
+    # ── Guarded writes (detect revision conflicts) ───────────────────
+
+    def guarded_batch_update(file_id, batch_request)
+      retries = 0
+      begin
+        @docs.batch_update_document(file_id, batch_request)
+      rescue Google::Apis::RateLimitError, Google::Apis::ServerError => e
+        raise ApiError, "Google API is temporarily unavailable (#{e.status_code})." if retries >= MAX_RETRIES
+        retries += 1
+        sleep(retries)
+        retry
+      end
+    rescue Google::Apis::AuthorizationError
+      raise AuthenticationError
+    rescue Google::Apis::ClientError => e
+      raise RevisionConflictError, "Document was modified concurrently." if e.status_code == 409
+      raise ApiError, "Google API request failed (#{e.status_code})."
+    end
+
+    # ── Docs API request builders ────────────────────────────────────
+
+    def build_guarded_batch(requests, revision_id)
+      Google::Apis::DocsV1::BatchUpdateDocumentRequest.new(
+        requests: requests,
+        write_control: Google::Apis::DocsV1::WriteControl.new(
+          required_revision_id: revision_id
+        )
+      )
+    end
+
+    def build_insert_row_request(tab_id, table_start_index, row_index)
+      Google::Apis::DocsV1::Request.new(
+        insert_table_row: Google::Apis::DocsV1::InsertTableRowRequest.new(
+          table_cell_location: Google::Apis::DocsV1::TableCellLocation.new(
+            table_start_location: Google::Apis::DocsV1::Location.new(
+              index: table_start_index,
+              tab_id: tab_id
+            ),
+            row_index: row_index,
+            column_index: 0
+          ),
+          insert_below: true
+        )
+      )
+    end
+
+    # Build cell-fill requests in right-to-left order (highest index first).
+    # When +clear+ is true, existing cell content is deleted first.
+    def build_cell_fill_requests(tab_id, cells, values, clear: true)
+      requests = []
+      cells.first(values.length).zip(values).reverse_each do |cell, value|
+        if clear && cell[:end_index] - 1 > cell[:start_index]
+          requests << Google::Apis::DocsV1::Request.new(
+            delete_content_range: Google::Apis::DocsV1::DeleteContentRangeRequest.new(
+              range: Google::Apis::DocsV1::Range.new(
+                start_index: cell[:start_index],
+                end_index: cell[:end_index] - 1,
+                tab_id: tab_id
+              )
+            )
+          )
+        end
+        requests << Google::Apis::DocsV1::Request.new(
+          insert_text: Google::Apis::DocsV1::InsertTextRequest.new(
+            location: Google::Apis::DocsV1::Location.new(
+              index: cell[:start_index],
+              tab_id: tab_id
+            ),
+            text: value.to_s
+          )
+        )
+      end
+      requests
+    end
+
+    # ── Result builders ──────────────────────────────────────────────
+
+    def append_result(status:, file:, revision_id:, cells:, dedup: nil, table_row_index: nil,
+                      verification: nil, warnings: [], dry_run: false)
+      result = {
+        status: status,
+        file_id: file.id,
+        revision_id: revision_id
+      }
+      if dedup && dedup[:match] && dedup[:match] != "none"
+        result[:dedup_value] = cells[dedup[:column_index]]
+      end
+      result[:table_row_index] = table_row_index if table_row_index
+      result[:verification] = verification if verification
+      result[:warnings] = warnings
+      result[:dry_run] = true if dry_run
+      result
+    end
+
+    def dedup_match?(table, dedup, cells)
+      return false unless dedup && dedup[:match] && dedup[:match] != "none"
+
+      col = dedup[:column_index]
+      value = cells[col]
+      DocTables.duplicate_row_index(table, column_index: col, value: value, match: dedup[:match])
+    end
+
+    # ── Analyze helpers ──────────────────────────────────────────────
+
+    def serialize_tab_analysis(tab)
+      {
+        tab_id: tab[:tab_id],
+        tables: tab[:tables].map do |t|
+          { start_index: t[:start_index], rows: t[:rows].length, columns: t[:columns] }
+        end,
+        outside_paragraphs: tab[:outside_paragraphs].map do |p|
+          { text: p[:text].strip[0..200], start_index: p[:start_index], end_index: p[:end_index] }
+        end,
+        detected_dates: DocTables.dated_paragraphs(tab).map do |o|
+          { text: o[:text].strip[0..200], start_index: o[:start_index] }
+        end
+      }
+    end
+
+    def serialize_table_rows(table)
+      table[:rows].map do |row|
+        {
+          row_index: row[:row_index],
+          cells: row[:cells].map { |c| { column_index: c[:column_index], text: c[:text].strip[0..200] } }
+        }
+      end
     end
 
     def extract_folder_id(value)

@@ -18,7 +18,9 @@ class DokService < Sinatra::Base
     "google_update_document" => Tools::UpdateDocument,
     "google_move_file" => Tools::MoveFile,
     "google_delete_file" => Tools::DeleteFile,
-    "google_export_file" => Tools::ExportFile
+    "google_export_file" => Tools::ExportFile,
+    "google_append_table_row" => Tools::AppendTableRow,
+    "google_analyze_document_tables" => Tools::AnalyzeDocumentTables
   }.freeze
 
   set :show_exceptions, false

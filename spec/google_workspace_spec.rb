@@ -323,13 +323,14 @@ RSpec.describe GoogleWorkspace::Client do
   class FakeDocs
     attr_reader :last_request
 
-    def get_document(_id)
+    def get_document(_id, **)
       paragraph = OpenStruct.new(
         elements: [OpenStruct.new(text_run: OpenStruct.new(content: "Hello\n"))]
       )
       OpenStruct.new(
         revision_id: "revision-1",
-        body: OpenStruct.new(content: [OpenStruct.new(paragraph: paragraph)])
+        body: OpenStruct.new(content: [OpenStruct.new(paragraph: paragraph)]),
+        tabs: []
       )
     end
 
@@ -339,6 +340,436 @@ RSpec.describe GoogleWorkspace::Client do
         write_control: OpenStruct.new(required_revision_id: "revision-2"),
         replies: []
       )
+    end
+  end
+
+  # ── Table-aware fake Docs service ────────────────────────────────
+
+  class FakeTableDocs
+    attr_reader :batch_requests
+
+    def initialize(snapshots)
+      @snapshots = snapshots
+      @read_count = 0
+      @batch_requests = []
+      @conflict_on_batch = nil
+    end
+
+    def get_document(_id, **)
+      doc = @snapshots[[@read_count, @snapshots.length - 1].min]
+      @read_count += 1
+      doc
+    end
+
+    def batch_update_document(_id, request)
+      if @conflict_on_batch == @batch_requests.length
+        @batch_requests << request
+        raise Google::Apis::ClientError.new("Conflict", status_code: 409)
+      end
+      @batch_requests << request
+      OpenStruct.new(
+        write_control: OpenStruct.new(required_revision_id: "revision-next"),
+        replies: []
+      )
+    end
+
+    def conflict_on_batch!(index)
+      @conflict_on_batch = index
+    end
+  end
+
+  # ── Document builders ─────────────────────────────────────────────
+
+  def table_doc(revision_id:, tab_id: "t.0", headers: nil, data_rows: [], outside: [])
+    headers ||= [
+      { text: "Datum\n", start: 3, end: 10 },
+      { text: "Inhoud van het contact\n", start: 11, end: 34 },
+      { text: "To do\n", start: 35, end: 42 }
+    ]
+    columns = headers.length
+
+    all_rows = [build_doc_row(headers)]
+    base = headers.last[:end] + 1
+    data_rows.each do |cells|
+      row = cells.map do |text|
+        cell = { text: "#{text}\n", start: base, end: base + text.length + 1 }
+        base += text.length + 2
+        cell
+      end
+      all_rows << build_doc_row(row)
+    end
+
+    table_element = OpenStruct.new(
+      start_index: 2, end_index: base,
+      table: OpenStruct.new(table_rows: all_rows, columns: columns),
+      paragraph: nil
+    )
+
+    content = [table_element]
+    outside.each do |para|
+      s = para[:start] || base + 1
+      content << OpenStruct.new(
+        start_index: s, end_index: s + para[:text].length,
+        paragraph: OpenStruct.new(elements: [OpenStruct.new(text_run: OpenStruct.new(content: para[:text]))]),
+        table: nil
+      )
+    end
+
+    tab = OpenStruct.new(
+      tab_properties: OpenStruct.new(tab_id: tab_id),
+      document_tab: OpenStruct.new(body: OpenStruct.new(content: content)),
+      child_tabs: []
+    )
+    OpenStruct.new(tabs: [tab], body: nil, revision_id: revision_id)
+  end
+
+  def placeholder_doc(revision_id:, tab_id: "t.0")
+    header = [
+      { text: "Datum\n", start: 3, end: 10 },
+      { text: "Inhoud van het contact\n", start: 11, end: 34 },
+      { text: "To do\n", start: 35, end: 42 }
+    ]
+    placeholder = [
+      { text: "<datum>\n", start: 43, end: 51 },
+      { text: "<inhoud>\n", start: 52, end: 61 },
+      { text: "<to do>\n", start: 62, end: 70 }
+    ]
+
+    table_element = OpenStruct.new(
+      start_index: 2, end_index: 71,
+      table: OpenStruct.new(table_rows: [build_doc_row(header), build_doc_row(placeholder)], columns: 3),
+      paragraph: nil
+    )
+
+    tab = OpenStruct.new(
+      tab_properties: OpenStruct.new(tab_id: tab_id),
+      document_tab: OpenStruct.new(body: OpenStruct.new(content: [table_element])),
+      child_tabs: []
+    )
+    OpenStruct.new(tabs: [tab], body: nil, revision_id: revision_id)
+  end
+
+  def build_doc_row(cells)
+    OpenStruct.new(table_cells: cells.map { |c| build_doc_cell(c) })
+  end
+
+  def build_doc_cell(cell)
+    OpenStruct.new(
+      start_index: cell[:start], end_index: cell[:end],
+      content: [OpenStruct.new(
+        start_index: cell[:start], end_index: cell[:end],
+        paragraph: OpenStruct.new(elements: [OpenStruct.new(text_run: OpenStruct.new(content: cell[:text]))]),
+        table: nil
+      )]
+    )
+  end
+
+  LOGBOOK_HEADERS = ["Datum", "Inhoud van het contact", "To do"].freeze
+  DATE_DEDUP = { column_index: 0, match: "date" }.freeze
+
+  # ── append_table_row ─────────────────────────────────────────────
+
+  describe "append_table_row" do
+    it "fills a placeholder row in a blank template" do
+      initial = placeholder_doc(revision_id: "rev-1")
+      final = table_doc(revision_id: "rev-2", data_rows: [["11/09/2026", "Begeleiding SV", "- Actie"]])
+
+      fake_docs = FakeTableDocs.new([initial, final])
+      c = described_class.new(configuration: { "root_folder_id" => "root" }, oauth_tokens: {},
+                              drive_service: drive, docs_service: fake_docs)
+
+      result = c.append_table_row(
+        file_id: "document", header_cells: LOGBOOK_HEADERS,
+        cells: ["11/09/2026", "Begeleiding SV", "- Actie"],
+        dedup: DATE_DEDUP, required_revision_id: "rev-1"
+      )
+
+      expect(result[:status]).to eq("inserted")
+      expect(result[:table_row_index]).to eq(1)
+      expect(result[:verification][:row_found]).to be(true)
+      expect(fake_docs.batch_requests.length).to eq(1)
+    end
+
+    it "inserts a new row in an existing table" do
+      initial = table_doc(revision_id: "rev-1", data_rows: [["01/01/2026", "Existing", "Old"]])
+      after_insert = table_doc(revision_id: "rev-2", data_rows: [["01/01/2026", "Existing", "Old"], ["", "", ""]])
+      final = table_doc(revision_id: "rev-3", data_rows: [["01/01/2026", "Existing", "Old"], ["11/09/2026", "New", "Todo"]])
+
+      fake_docs = FakeTableDocs.new([initial, after_insert, final])
+      c = described_class.new(configuration: { "root_folder_id" => "root" }, oauth_tokens: {},
+                              drive_service: drive, docs_service: fake_docs)
+
+      result = c.append_table_row(
+        file_id: "document", header_cells: LOGBOOK_HEADERS,
+        cells: ["11/09/2026", "New", "Todo"], dedup: DATE_DEDUP, required_revision_id: "rev-1"
+      )
+
+      expect(result[:status]).to eq("inserted")
+      expect(result[:table_row_index]).to eq(2)
+      expect(result[:verification][:previous_rows_intact]).to be(true)
+      expect(fake_docs.batch_requests.length).to eq(2)
+    end
+
+    it "returns duplicate with date dedup" do
+      doc = table_doc(revision_id: "rev-1", data_rows: [["11/09/2026", "Existing", "Todo"]])
+      fake_docs = FakeTableDocs.new([doc])
+      c = described_class.new(configuration: { "root_folder_id" => "root" }, oauth_tokens: {},
+                              drive_service: drive, docs_service: fake_docs)
+
+      result = c.append_table_row(
+        file_id: "document", header_cells: LOGBOOK_HEADERS,
+        cells: ["11/09/2026", "Another", "More"], dedup: DATE_DEDUP, required_revision_id: "rev-1"
+      )
+
+      expect(result[:status]).to eq("duplicate")
+      expect(result[:dedup_value]).to eq("11/09/2026")
+      expect(fake_docs.batch_requests).to be_empty
+    end
+
+    it "returns duplicate with exact dedup on a two-column table" do
+      headers = [
+        { text: "Name\n", start: 3, end: 9 },
+        { text: "Email\n", start: 10, end: 17 }
+      ]
+      doc = table_doc(revision_id: "rev-1", headers: headers, data_rows: [["Alice", "alice@x.com"]])
+      fake_docs = FakeTableDocs.new([doc])
+      c = described_class.new(configuration: { "root_folder_id" => "root" }, oauth_tokens: {},
+                              drive_service: drive, docs_service: fake_docs)
+
+      result = c.append_table_row(
+        file_id: "document", header_cells: ["Name", "Email"],
+        cells: ["Alice", "alice-new@x.com"],
+        dedup: { column_index: 0, match: "exact" }
+      )
+
+      expect(result[:status]).to eq("duplicate")
+      expect(result[:dedup_value]).to eq("Alice")
+    end
+
+    it "inserts without dedup when dedup is nil" do
+      initial = table_doc(revision_id: "rev-1", data_rows: [["11/09/2026", "Existing", "Todo"]])
+      after_insert = table_doc(revision_id: "rev-2", data_rows: [
+        ["11/09/2026", "Existing", "Todo"], ["", "", ""]
+      ])
+      final = table_doc(revision_id: "rev-3", data_rows: [
+        ["11/09/2026", "Existing", "Todo"], ["11/09/2026", "Second entry", "More"]
+      ])
+
+      fake_docs = FakeTableDocs.new([initial, after_insert, final])
+      c = described_class.new(configuration: { "root_folder_id" => "root" }, oauth_tokens: {},
+                              drive_service: drive, docs_service: fake_docs)
+
+      result = c.append_table_row(
+        file_id: "document", header_cells: LOGBOOK_HEADERS,
+        cells: ["11/09/2026", "Second entry", "More"]
+      )
+
+      expect(result[:status]).to eq("inserted")
+      expect(result).not_to have_key(:dedup_value)
+    end
+
+    it "normalises dates for duplicate detection" do
+      doc = table_doc(revision_id: "rev-1", data_rows: [["1/9/2026", "Existing", "Todo"]])
+      fake_docs = FakeTableDocs.new([doc])
+      c = described_class.new(configuration: { "root_folder_id" => "root" }, oauth_tokens: {},
+                              drive_service: drive, docs_service: fake_docs)
+
+      result = c.append_table_row(
+        file_id: "document", header_cells: LOGBOOK_HEADERS,
+        cells: ["01/09/2026", "Entry", "Todo"], dedup: DATE_DEDUP
+      )
+
+      expect(result[:status]).to eq("duplicate")
+    end
+
+    it "returns table_not_found when headers do not match" do
+      doc = table_doc(revision_id: "rev-1")
+      fake_docs = FakeTableDocs.new([doc])
+      c = described_class.new(configuration: { "root_folder_id" => "root" }, oauth_tokens: {},
+                              drive_service: drive, docs_service: fake_docs)
+
+      result = c.append_table_row(
+        file_id: "document", header_cells: ["Wrong", "Headers"],
+        cells: ["A", "B"]
+      )
+
+      expect(result[:status]).to eq("table_not_found")
+    end
+
+    it "returns revision_conflict when required_revision_id is stale" do
+      doc = table_doc(revision_id: "rev-2")
+      fake_docs = FakeTableDocs.new([doc])
+      c = described_class.new(configuration: { "root_folder_id" => "root" }, oauth_tokens: {},
+                              drive_service: drive, docs_service: fake_docs)
+
+      result = c.append_table_row(
+        file_id: "document", header_cells: LOGBOOK_HEADERS,
+        cells: ["11/09/2026", "Content", "Todo"], dedup: DATE_DEDUP,
+        required_revision_id: "rev-1"
+      )
+
+      expect(result[:status]).to eq("revision_conflict")
+    end
+
+    it "returns duplicate on stale revision when value was already added" do
+      doc = table_doc(revision_id: "rev-2", data_rows: [["11/09/2026", "Already there", "Done"]])
+      fake_docs = FakeTableDocs.new([doc])
+      c = described_class.new(configuration: { "root_folder_id" => "root" }, oauth_tokens: {},
+                              drive_service: drive, docs_service: fake_docs)
+
+      result = c.append_table_row(
+        file_id: "document", header_cells: LOGBOOK_HEADERS,
+        cells: ["11/09/2026", "Content", "Todo"], dedup: DATE_DEDUP,
+        required_revision_id: "rev-1"
+      )
+
+      expect(result[:status]).to eq("duplicate")
+    end
+
+    it "performs a dry run without writing" do
+      doc = table_doc(revision_id: "rev-1", data_rows: [["01/01/2026", "Existing", "Todo"]])
+      fake_docs = FakeTableDocs.new([doc])
+      c = described_class.new(configuration: { "root_folder_id" => "root" }, oauth_tokens: {},
+                              drive_service: drive, docs_service: fake_docs)
+
+      result = c.append_table_row(
+        file_id: "document", header_cells: LOGBOOK_HEADERS,
+        cells: ["11/09/2026", "Content", "Todo"], dedup: DATE_DEDUP, dry_run: true
+      )
+
+      expect(result[:status]).to eq("inserted")
+      expect(result[:dry_run]).to be(true)
+      expect(result[:table_row_index]).to eq(2)
+      expect(fake_docs.batch_requests).to be_empty
+    end
+
+    it "retries on revision conflict during row insert" do
+      initial = table_doc(revision_id: "rev-1")
+      after_conflict = table_doc(revision_id: "rev-2")
+      after_insert = table_doc(revision_id: "rev-3", data_rows: [["", "", ""]])
+      final = table_doc(revision_id: "rev-4", data_rows: [["11/09/2026", "Content", "Todo"]])
+
+      fake_docs = FakeTableDocs.new([initial, after_conflict, after_insert, final])
+      fake_docs.conflict_on_batch!(0)
+      c = described_class.new(configuration: { "root_folder_id" => "root" }, oauth_tokens: {},
+                              drive_service: drive, docs_service: fake_docs)
+
+      result = c.append_table_row(
+        file_id: "document", header_cells: LOGBOOK_HEADERS,
+        cells: ["11/09/2026", "Content", "Todo"], dedup: DATE_DEDUP,
+        required_revision_id: "rev-1"
+      )
+
+      expect(result[:status]).to eq("inserted")
+      expect(fake_docs.batch_requests.length).to eq(3)
+    end
+
+    it "uses tabId in all Docs API requests" do
+      initial = placeholder_doc(revision_id: "rev-1", tab_id: "t.custom")
+      final = table_doc(revision_id: "rev-2", tab_id: "t.custom", data_rows: [["11/09/2026", "Content", "Todo"]])
+
+      fake_docs = FakeTableDocs.new([initial, final])
+      c = described_class.new(configuration: { "root_folder_id" => "root" }, oauth_tokens: {},
+                              drive_service: drive, docs_service: fake_docs)
+
+      c.append_table_row(
+        file_id: "document", header_cells: LOGBOOK_HEADERS,
+        cells: ["11/09/2026", "Content", "Todo"]
+      )
+
+      fake_docs.batch_requests[0].requests.each do |req|
+        expect(req.insert_text.location.tab_id).to eq("t.custom") if req.insert_text
+        expect(req.delete_content_range.range.tab_id).to eq("t.custom") if req.delete_content_range
+      end
+    end
+
+    it "never uses endOfSegmentLocation" do
+      initial = placeholder_doc(revision_id: "rev-1")
+      final = table_doc(revision_id: "rev-2", data_rows: [["11/09/2026", "Content", "Todo"]])
+
+      fake_docs = FakeTableDocs.new([initial, final])
+      c = described_class.new(configuration: { "root_folder_id" => "root" }, oauth_tokens: {},
+                              drive_service: drive, docs_service: fake_docs)
+
+      c.append_table_row(
+        file_id: "document", header_cells: LOGBOOK_HEADERS,
+        cells: ["11/09/2026", "Content", "Todo"]
+      )
+
+      fake_docs.batch_requests.each do |batch|
+        batch.requests.each do |req|
+          next unless req.insert_text
+          expect(req.insert_text.location.index).to be_a(Integer)
+          expect(req.insert_text.end_of_segment_location).to be_nil
+        end
+      end
+    end
+
+    it "handles Dutch special characters" do
+      initial = table_doc(revision_id: "rev-1")
+      after_insert = table_doc(revision_id: "rev-2", data_rows: [["", "", ""]])
+      final = table_doc(revision_id: "rev-3", data_rows: [
+        ["11/09/2026", "Begeleiding met co\u00F6rdinatie", "- \u00C9\u00E9n actie"]
+      ])
+
+      fake_docs = FakeTableDocs.new([initial, after_insert, final])
+      c = described_class.new(configuration: { "root_folder_id" => "root" }, oauth_tokens: {},
+                              drive_service: drive, docs_service: fake_docs)
+
+      result = c.append_table_row(
+        file_id: "document", header_cells: LOGBOOK_HEADERS,
+        cells: ["11/09/2026", "Begeleiding met co\u00F6rdinatie", "- \u00C9\u00E9n actie"],
+        dedup: DATE_DEDUP
+      )
+
+      expect(result[:status]).to eq("inserted")
+      expect(result[:verification][:row_found]).to be(true)
+    end
+  end
+
+  # ── analyze_document_tables ──────────────────────────────────────
+
+  describe "analyze_document_tables" do
+    it "returns table structure and outside paragraphs" do
+      doc = table_doc(
+        revision_id: "rev-1",
+        data_rows: [["01/01/2026", "Entry", "Todo"]],
+        outside: [{ text: "11/09/2026 Loose text\n", start: 300 }]
+      )
+      fake_docs = FakeTableDocs.new([doc])
+      c = described_class.new(configuration: { "root_folder_id" => "root" }, oauth_tokens: {},
+                              drive_service: drive, docs_service: fake_docs)
+
+      result = c.analyze_document_tables(file_id: "document", header_cells: LOGBOOK_HEADERS)
+
+      expect(result[:id]).to eq("document")
+      expect(result[:matched_table]).not_to be_nil
+      expect(result[:matched_table][:rows].length).to eq(2) # header + 1 data row
+      expect(result[:tabs][0][:detected_dates].length).to eq(1)
+    end
+
+    it "reports no match when headers differ" do
+      doc = table_doc(revision_id: "rev-1")
+      fake_docs = FakeTableDocs.new([doc])
+      c = described_class.new(configuration: { "root_folder_id" => "root" }, oauth_tokens: {},
+                              drive_service: drive, docs_service: fake_docs)
+
+      result = c.analyze_document_tables(file_id: "document", header_cells: ["Wrong"])
+
+      expect(result[:matched_table]).to be_nil
+      expect(result[:warnings]).to include(match(/No table found/))
+    end
+
+    it "works without header_cells" do
+      doc = table_doc(revision_id: "rev-1", data_rows: [["01/01/2026", "Entry", "Todo"]])
+      fake_docs = FakeTableDocs.new([doc])
+      c = described_class.new(configuration: { "root_folder_id" => "root" }, oauth_tokens: {},
+                              drive_service: drive, docs_service: fake_docs)
+
+      result = c.analyze_document_tables(file_id: "document")
+
+      expect(result[:tabs][0][:tables].length).to eq(1)
+      expect(result).not_to have_key(:matched_table)
     end
   end
 end
