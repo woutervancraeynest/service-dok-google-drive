@@ -349,9 +349,9 @@ module GoogleWorkspace
         return append_result(status: "duplicate", file: file, revision_id: rev0, cells: cells, dedup: dedup)
       end
 
-      # 5. Determine path: placeholder fill or row insert
-      placeholder_idx = use_placeholder_row ? DocTables.placeholder_row_index(table0) : nil
-      target_row_index = placeholder_idx || table0[:rows].length
+      # 5. Determine path: reuse existing empty row or insert new one
+      reuse_idx = use_placeholder_row ? DocTables.reusable_row_index(table0) : nil
+      target_row_index = reuse_idx || table0[:rows].length
 
       # 6. Dry run — report what would happen, no writes
       if dry_run
@@ -363,9 +363,9 @@ module GoogleWorkspace
 
       values = cells.map(&:to_s)
 
-      if placeholder_idx
-        # ── Placeholder fill ─────────────────────────────────────────
-        row = table0[:rows][placeholder_idx]
+      if reuse_idx
+        # ── Fill existing empty/placeholder row ──────────────────────
+        row = table0[:rows][reuse_idx]
         if row[:cells].length < values.length
           return append_result(status: "malformed_table", file: file, revision_id: rev0, cells: cells, dedup: dedup,
                                warnings: ["Placeholder row has #{row[:cells].length} cells, expected #{values.length}."])
@@ -757,16 +757,21 @@ module GoogleWorkspace
     end
 
     # Build cell-fill requests in right-to-left order (highest index first).
+    # Uses text_start_index / text_end_index (content paragraph positions)
+    # rather than cell structural boundaries to avoid invalid-index errors.
     # When +clear+ is true, existing cell content is deleted first.
     def build_cell_fill_requests(tab_id, cells, values, clear: true)
       requests = []
       cells.first(values.length).zip(values).reverse_each do |cell, value|
-        if clear && cell[:end_index] - 1 > cell[:start_index]
+        text_start = cell[:text_start_index]
+        text_end = cell[:text_end_index]
+
+        if clear && text_end - 1 > text_start
           requests << Google::Apis::DocsV1::Request.new(
             delete_content_range: Google::Apis::DocsV1::DeleteContentRangeRequest.new(
               range: Google::Apis::DocsV1::Range.new(
-                start_index: cell[:start_index],
-                end_index: cell[:end_index] - 1,
+                start_index: text_start,
+                end_index: text_end - 1,
                 tab_id: tab_id
               )
             )
@@ -775,7 +780,7 @@ module GoogleWorkspace
         requests << Google::Apis::DocsV1::Request.new(
           insert_text: Google::Apis::DocsV1::InsertTextRequest.new(
             location: Google::Apis::DocsV1::Location.new(
-              index: cell[:start_index],
+              index: text_start,
               tab_id: tab_id
             ),
             text: value.to_s

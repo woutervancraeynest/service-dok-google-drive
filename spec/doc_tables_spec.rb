@@ -19,10 +19,12 @@ RSpec.describe DocTables do
   end
 
   def table_cell(text, start_index:, end_index:)
+    # Realistic: content paragraph starts 1 past the cell boundary
+    content_start = start_index + 1
     OpenStruct.new(
       start_index: start_index, end_index: end_index,
       content: [OpenStruct.new(
-        start_index: start_index, end_index: end_index,
+        start_index: content_start, end_index: end_index,
         paragraph: paragraph(text), table: nil
       )]
     )
@@ -279,6 +281,53 @@ RSpec.describe DocTables do
     end
   end
 
+  # ── reusable_row_index ────────────────────────────────────────────
+
+  describe ".reusable_row_index" do
+    it "detects a placeholder row in a blank template" do
+      table = build_parsed_table_with_placeholder
+
+      expect(DocTables.reusable_row_index(table)).to eq(1)
+    end
+
+    it "detects a trailing empty row after existing data" do
+      table = build_parsed_table(["01/01/2026", "A", "B"], ["", "", ""])
+
+      expect(DocTables.reusable_row_index(table)).to eq(2)
+    end
+
+    it "returns nil when last row has content" do
+      table = build_parsed_table(["01/01/2026", "A", "B"])
+
+      expect(DocTables.reusable_row_index(table)).to be_nil
+    end
+
+    it "returns nil when table has no data rows" do
+      table = { rows: [{ row_index: 0, cells: header_row_cells }] }
+
+      expect(DocTables.reusable_row_index(table)).to be_nil
+    end
+  end
+
+  # ── parse content indices ────────────────────────────────────────
+
+  describe ".parse content indices" do
+    it "sets text_start_index one past the cell boundary" do
+      table = structural_table(
+        [logbook_header_row],
+        start_index: 2, end_index: 43
+      )
+      tab = tab_with_content("t.0", table)
+      doc = document_with_tabs(tab)
+
+      result = DocTables.parse(doc)
+      cell = result[0][:tables][0][:rows][0][:cells][0]
+
+      expect(cell[:text_start_index]).to eq(cell[:start_index] + 1)
+      expect(cell[:text_end_index]).to eq(cell[:end_index])
+    end
+  end
+
   # ── dated_paragraphs ─────────────────────────────────────────────
 
   describe ".dated_paragraphs" do
@@ -412,7 +461,10 @@ RSpec.describe DocTables do
     data_rows.each_with_index do |values, idx|
       rows << {
         row_index: idx + 1,
-        cells: values.each_with_index.map { |v, col| { text: "#{v}\n", column_index: col, start_index: 0, end_index: 0 } }
+        cells: values.each_with_index.map do |v, col|
+          { text: "#{v}\n", column_index: col, start_index: 0, end_index: 0,
+            text_start_index: 1, text_end_index: 0 }
+        end
       }
     end
     { start_index: 2, end_index: 200, rows: rows, columns: cols }
@@ -424,9 +476,12 @@ RSpec.describe DocTables do
       rows: [
         { row_index: 0, cells: header_row_cells },
         { row_index: 1, cells: [
-          { text: "<datum>\n", column_index: 0, start_index: 43, end_index: 51 },
-          { text: "<inhoud>\n", column_index: 1, start_index: 52, end_index: 61 },
-          { text: "<to do>\n", column_index: 2, start_index: 62, end_index: 70 }
+          { text: "<datum>\n", column_index: 0, start_index: 43, end_index: 52,
+            text_start_index: 44, text_end_index: 52 },
+          { text: "<inhoud>\n", column_index: 1, start_index: 53, end_index: 63,
+            text_start_index: 54, text_end_index: 63 },
+          { text: "<to do>\n", column_index: 2, start_index: 64, end_index: 73,
+            text_start_index: 65, text_end_index: 73 }
         ] }
       ]
     }

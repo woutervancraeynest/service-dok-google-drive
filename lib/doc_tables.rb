@@ -82,21 +82,39 @@ module DocTables
       nil
     end
 
-    # ── Placeholder detection ──────────────────────────────────────────
+    # ── Reusable row detection ────────────────────────────────────────
 
-    # If the table has exactly one data row and every cell in that row
-    # is either blank or a <token> placeholder, return its row_index (1).
-    # Otherwise nil.
+    # Find a data row that can be filled in place instead of inserting
+    # a new row.  Returns the row_index or nil.
+    #
+    # Two cases:
+    # 1. Blank template — exactly one data row, all cells empty/<token>.
+    # 2. Trailing empty row — the last data row is entirely empty
+    #    (artefact of a failed partial insert).
+    def reusable_row_index(table)
+      data_rows = table[:rows][1..]
+      return nil unless data_rows && data_rows.any?
+
+      # Case 1: classic placeholder (single data row with tokens/empty)
+      if data_rows.length == 1 && row_blank_or_placeholder?(data_rows[0])
+        return 1
+      end
+
+      # Case 2: trailing empty row (all cells are just whitespace/newline)
+      last = data_rows.last
+      if last[:cells].all? { |c| c[:text].to_s.strip.empty? }
+        return last[:row_index]
+      end
+
+      nil
+    end
+
+    # Keep as public alias for backward compatibility in tests.
     def placeholder_row_index(table)
       data_rows = table[:rows][1..]
       return nil unless data_rows && data_rows.length == 1
 
-      row = data_rows[0]
-      all_placeholder = row[:cells].all? do |cell|
-        text = cell[:text].to_s.strip
-        text.empty? || text.match?(PLACEHOLDER_TOKEN)
-      end
-      all_placeholder ? 1 : nil
+      row_blank_or_placeholder?(data_rows[0]) ? 1 : nil
     end
 
     # ── Outside-text helpers ───────────────────────────────────────────
@@ -220,10 +238,13 @@ module DocTables
       table = element.table
       rows = Array(table.table_rows).each_with_index.map do |row, row_idx|
         cells = Array(row.table_cells).each_with_index.map do |cell, col_idx|
+          content_elements = Array(cell.content)
           {
             column_index: col_idx,
             start_index: cell.start_index,
             end_index: cell.end_index,
+            text_start_index: content_elements.first&.start_index || cell.start_index + 1,
+            text_end_index: content_elements.last&.end_index || cell.end_index,
             text: cell_text(cell)
           }
         end
@@ -257,11 +278,13 @@ module DocTables
     end
 
     def non_placeholder_rows(table)
-      (table[:rows][1..] || []).reject do |row|
-        row[:cells].all? do |cell|
-          text = cell[:text].to_s.strip
-          text.empty? || text.match?(PLACEHOLDER_TOKEN)
-        end
+      (table[:rows][1..] || []).reject { |row| row_blank_or_placeholder?(row) }
+    end
+
+    def row_blank_or_placeholder?(row)
+      row[:cells].all? do |cell|
+        text = cell[:text].to_s.strip
+        text.empty? || text.match?(PLACEHOLDER_TOKEN)
       end
     end
 

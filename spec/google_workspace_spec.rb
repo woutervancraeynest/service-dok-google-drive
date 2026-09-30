@@ -454,10 +454,12 @@ RSpec.describe GoogleWorkspace::Client do
   end
 
   def build_doc_cell(cell)
+    # Realistic: content paragraph starts 1 past the cell boundary
+    content_start = cell[:start] + 1
     OpenStruct.new(
       start_index: cell[:start], end_index: cell[:end],
       content: [OpenStruct.new(
-        start_index: cell[:start], end_index: cell[:end],
+        start_index: content_start, end_index: cell[:end],
         paragraph: OpenStruct.new(elements: [OpenStruct.new(text_run: OpenStruct.new(content: cell[:text]))]),
         table: nil
       )]
@@ -488,6 +490,48 @@ RSpec.describe GoogleWorkspace::Client do
       expect(result[:table_row_index]).to eq(1)
       expect(result[:verification][:row_found]).to be(true)
       expect(fake_docs.batch_requests.length).to eq(1)
+    end
+
+    it "uses text_start_index (not cell boundary) for insertText" do
+      initial = placeholder_doc(revision_id: "rev-1")
+      final = table_doc(revision_id: "rev-2", data_rows: [["11/09/2026", "Content", "Todo"]])
+
+      fake_docs = FakeTableDocs.new([initial, final])
+      c = described_class.new(configuration: { "root_folder_id" => "root" }, oauth_tokens: {},
+                              drive_service: drive, docs_service: fake_docs)
+
+      c.append_table_row(
+        file_id: "document", header_cells: LOGBOOK_HEADERS,
+        cells: ["11/09/2026", "Content", "Todo"]
+      )
+
+      batch = fake_docs.batch_requests[0]
+      batch.requests.select { |r| r.insert_text }.each do |req|
+        # Content paragraph starts at cell boundary + 1; insertText must
+        # target that position, never the cell's own start_index.
+        expect(req.insert_text.location.index).to be > 2
+        # Placeholder cells start at 43,52,62 — content at 44,53,63
+        expect([44, 53, 63]).to include(req.insert_text.location.index)
+      end
+    end
+
+    it "reuses a trailing empty row from a failed partial insert" do
+      initial = table_doc(revision_id: "rev-1", data_rows: [["01/01/2026", "Existing", "Old"], ["", "", ""]])
+      final = table_doc(revision_id: "rev-2", data_rows: [["01/01/2026", "Existing", "Old"], ["11/09/2026", "New", "Todo"]])
+
+      fake_docs = FakeTableDocs.new([initial, final])
+      c = described_class.new(configuration: { "root_folder_id" => "root" }, oauth_tokens: {},
+                              drive_service: drive, docs_service: fake_docs)
+
+      result = c.append_table_row(
+        file_id: "document", header_cells: LOGBOOK_HEADERS,
+        cells: ["11/09/2026", "New", "Todo"], dedup: DATE_DEDUP
+      )
+
+      expect(result[:status]).to eq("inserted")
+      expect(result[:table_row_index]).to eq(2) # reused the empty row
+      expect(fake_docs.batch_requests.length).to eq(1) # fill only, no insertTableRow
+      expect(result[:verification][:previous_rows_intact]).to be(true)
     end
 
     it "inserts a new row in an existing table" do
