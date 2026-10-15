@@ -1,4 +1,5 @@
 require "base64"
+require "digest"
 require "googleauth"
 require "google/apis/drive_v3"
 require "google/apis/docs_v1"
@@ -32,6 +33,35 @@ module GoogleWorkspace
   class ScopeError < Error; end
   class ApiError < Error; end
   class RevisionConflictError < Error; end
+
+  REVISION_TOKEN_PATTERN = /\Ar-[0-9a-f]{12}\z/.freeze
+
+  # Short, copy-safe stand-in for a Docs revision ID. Revision IDs are
+  # ~100 random characters that language models do not copy reliably.
+  def self.revision_token(revision_id)
+    return nil if revision_id.to_s.empty?
+
+    "r-#{Digest::SHA256.hexdigest(revision_id.to_s)[0, 12]}"
+  end
+
+  # Accepts the full revision ID or its revision token.
+  def self.revision_matches?(given, actual)
+    given = given.to_s.strip
+    return false if given.empty? || actual.to_s.empty?
+
+    given == actual || given == revision_token(actual)
+  end
+
+  # Same start and end but not equal: most likely a mis-copied ID rather
+  # than a newer revision.
+  def self.likely_miscopied_revision?(given, actual)
+    given = given.to_s.strip
+    actual = actual.to_s
+    return false if given == actual || given.match?(REVISION_TOKEN_PATTERN)
+    return false if given.length < 20 || actual.length < 20
+
+    actual.start_with?(given[0, 8]) && actual.end_with?(given[-8..])
+  end
 
   class Client
     attr_reader :root_folder_id
@@ -240,10 +270,19 @@ module GoogleWorkspace
         Google::Apis::DocsV1::Request.new(**symbolize_keys(request))
       end
 
-      write_control = if required_revision_id.to_s.strip.empty?
+      required_revision_id = required_revision_id.to_s.strip
+      if required_revision_id.match?(REVISION_TOKEN_PATTERN)
+        current = api_call { @docs.get_document(file.id) }.revision_id
+        unless GoogleWorkspace.revision_matches?(required_revision_id, current)
+          raise ApiError, "Revision conflict: the document changed since it was read. Read it again."
+        end
+        required_revision_id = current
+      end
+
+      write_control = if required_revision_id.empty?
         nil
       else
-        Google::Apis::DocsV1::WriteControl.new(required_revision_id: required_revision_id.to_s)
+        Google::Apis::DocsV1::WriteControl.new(required_revision_id: required_revision_id)
       end
 
       body = Google::Apis::DocsV1::BatchUpdateDocumentRequest.new(
@@ -256,6 +295,7 @@ module GoogleWorkspace
         id: file.id,
         name: file.name,
         revision_id: result.write_control&.required_revision_id,
+        revision_token: GoogleWorkspace.revision_token(result.write_control&.required_revision_id),
         replies: result.replies&.map(&:to_h) || []
       }
     end
@@ -330,7 +370,7 @@ module GoogleWorkspace
       parsed0 = DocTables.parse(doc0)
 
       # 2. Revision guard — the agent's last-known revision must match
-      if !required_revision_id.to_s.strip.empty? && required_revision_id.to_s.strip != rev0
+      if !required_revision_id.to_s.strip.empty? && !GoogleWorkspace.revision_matches?(required_revision_id, rev0)
         match = DocTables.find_table(parsed0, header_cells)
         if match && dedup_match?(match[:table], dedup, cells)
           return append_result(status: "duplicate", file: file, revision_id: rev0, cells: cells, dedup: dedup)
@@ -473,6 +513,7 @@ module GoogleWorkspace
         id: file.id,
         name: file.name,
         revision_id: doc.revision_id,
+        revision_token: GoogleWorkspace.revision_token(doc.revision_id),
         tabs: parsed.map { |tab| serialize_tab_analysis(tab) }
       }
 
@@ -510,6 +551,7 @@ module GoogleWorkspace
         id: file.id,
         name: file.name,
         revision_id: doc.revision_id,
+        revision_token: GoogleWorkspace.revision_token(doc.revision_id),
         table_count: tables.length,
         tables: tables.first(MAX_INSPECT_TABLES),
         truncated: tables.length > MAX_INSPECT_TABLES
@@ -538,9 +580,8 @@ module GoogleWorkspace
 
       doc0 = get_structured_document(file.id)
       rev0 = doc0.revision_id
-      if required_revision_id != rev0
-        return cell_result("revision_conflict", file, rev0,
-                           message: "The document changed since it was read. Inspect it again.")
+      unless GoogleWorkspace.revision_matches?(required_revision_id, rev0)
+        return cell_result("revision_conflict", file, rev0, **pre_check_conflict(required_revision_id, rev0))
       end
 
       parsed0 = DocTables.parse(doc0)
@@ -588,29 +629,45 @@ module GoogleWorkspace
                                     "Inspect the cell before retrying.")
       end
       rev1 = doc1.revision_id
-      verification = DocTableCells.verify_update(parsed0, DocTables.parse(doc1), target, value)
+      parsed1 = DocTables.parse(doc1)
+      verification = DocTableCells.verify_update(parsed0, parsed1, target, value)
 
       if write_error.nil?
         status = verification[:ok] ? "updated" : "verification_failed"
-        return cell_result(status, file, rev1, written: true, **details, verification: verification)
+        return cell_result(status, file, rev1, written: true, **details, verification: verification,
+                           phase: verification[:ok] ? nil : "verify")
       end
 
-      if rev1 == rev0
-        return cell_result("write_failed", file, rev1, **details,
-                           message: "Google Docs rejected the update (#{api_error_code(write_error)}).")
-      end
+      error_info = write_error_details(write_error)
+      $stderr.puts "[update_table_cell] #{file.id}: write rejected (#{error_info[:status_code] || 'n/a'}): #{error_info[:message]}"
+      write_context = { phase: "write", write_error: error_info }
+
       if verification[:ok]
         return cell_result("updated", file, rev1, written: true, **details, verification: verification)
       end
 
-      current = DocTableCells.locate(DocTables.parse(doc1), target[:tab_id], target[:table][:table_index],
-                                     target[:row_index], target[:column_index])
-      if current && DocTableCells.clean_value(current[:text]) == old_value
-        return cell_result("revision_conflict", file, rev1, **details,
-                           message: "The document changed concurrently; the update was not applied.")
+      # Decide on content, not on revision IDs: Google may change the ID
+      # without a content change.
+      if DocTableCells.content_signature(parsed0) == DocTableCells.content_signature(parsed1)
+        if rev1 != rev0 && revision_error?(write_error)
+          return cell_result("revision_conflict", file, rev1, **details, **write_context,
+                             message: "Google rejected the write because the revision changed, although the " \
+                                      "table content is unchanged. Inspect the document again and retry.")
+        end
+        return cell_result("write_failed", file, rev1, **details, **write_context,
+                           message: "Google Docs rejected the update (#{error_info[:status_code] || 'error'}): " \
+                                    "#{error_info[:message]} The document is unchanged.")
       end
 
-      cell_result("verification_failed", file, rev1, written: "unknown", **details, verification: verification,
+      current = DocTableCells.locate(parsed1, target[:tab_id], target[:table][:table_index],
+                                     target[:row_index], target[:column_index])
+      if current && DocTableCells.clean_value(current[:text]) == old_value
+        return cell_result("revision_conflict", file, rev1, **details, **write_context,
+                           message: "The document content changed concurrently; the update was not applied.")
+      end
+
+      cell_result("verification_failed", file, rev1, written: "unknown", **details, **write_context,
+                  verification: verification,
                   message: "The document changed concurrently; inspect the cell before retrying.")
     end
 
@@ -627,12 +684,38 @@ module GoogleWorkspace
       e
     end
 
-    def api_error_code(error)
-      error.respond_to?(:status_code) && error.status_code ? error.status_code : error.class.name.split("::").last
+    def write_error_details(error)
+      code = error.respond_to?(:status_code) ? error.status_code : nil
+      { status_code: code, message: error.message.to_s[0, 500] }.compact
+    end
+
+    def revision_error?(error)
+      (error.respond_to?(:status_code) && error.status_code == 409) || error.message.to_s.match?(/revision/i)
+    end
+
+    def pre_check_conflict(given, current)
+      token = GoogleWorkspace.revision_token(current)
+      base = { phase: "pre_check", expected_revision_id: given, current_revision_id: current }
+      if GoogleWorkspace.likely_miscopied_revision?(given, current)
+        base.merge(
+          likely_copy_error: true,
+          message: "The supplied revision ID (#{given.length} characters) does not match the current revision " \
+                   "(#{current.to_s.length} characters) but has the same start and end, so it was probably copied " \
+                   "incorrectly; the document may be unchanged. Retry with required_revision_id \"#{token}\"."
+        )
+      else
+        base.merge(message: "The document changed since it was read. Inspect it again and use the new revision_token.")
+      end
     end
 
     def cell_result(status, file, revision_id, written: false, **extra)
-      { status: status, file_id: file.id, written: written, revision_id: revision_id }.merge(extra.compact)
+      {
+        status: status,
+        file_id: file.id,
+        written: written,
+        revision_id: revision_id,
+        revision_token: GoogleWorkspace.revision_token(revision_id)
+      }.merge(extra.compact)
     end
 
     def read_document_internal(file)
@@ -646,6 +729,7 @@ module GoogleWorkspace
         name: file.name,
         mime_type: file.mime_type,
         revision_id: document.revision_id,
+        revision_token: GoogleWorkspace.revision_token(document.revision_id),
         text: document_text(document),
         web_view_link: file.web_view_link
       }
@@ -939,7 +1023,8 @@ module GoogleWorkspace
       result = {
         status: status,
         file_id: file.id,
-        revision_id: revision_id
+        revision_id: revision_id,
+        revision_token: GoogleWorkspace.revision_token(revision_id)
       }
       if dedup && dedup[:match] && dedup[:match] != "none"
         result[:dedup_value] = cells[dedup[:column_index]]

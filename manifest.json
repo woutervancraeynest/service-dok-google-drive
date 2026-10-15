@@ -180,7 +180,7 @@
           },
           "required_revision_id": {
             "type": "string",
-            "description": "Revision ID returned by google_read_document. The update is rejected if the document changed since it was read."
+            "description": "Prefer the short revision_token (r-...) returned by google_read_document; the full revision_id is also accepted. The update is rejected if the document changed since it was read."
           }
         },
         "required": ["file_id", "requests"]
@@ -305,7 +305,7 @@
           },
           "required_revision_id": {
             "type": "string",
-            "description": "Revision ID from google_read_document. The operation is rejected if the document changed since it was read."
+            "description": "Prefer the short revision_token (r-...) from google_read_document or google_inspect_document_tables; the full revision_id is also accepted. The operation is rejected if the document changed since it was read."
           },
           "dry_run": {
             "type": "boolean",
@@ -353,7 +353,7 @@
     },
     {
       "name": "google_inspect_document_tables",
-      "description": "Inspect all tables of a Google Docs document cell by cell. Returns per table a stable table_id, label and section heading, and per cell a stable cell_id, its text and its state (empty, placeholder or filled). Use this before google_update_table_cell. No Docs indices are returned; never compute them yourself.",
+      "description": "Inspect all tables of a Google Docs document cell by cell. Returns revision_token (use it as required_revision_id) and per table a stable table_id, label and section heading, and per cell a stable cell_id, its text and its state (empty, placeholder or filled). Use this before google_update_table_cell. No Docs indices are returned; never compute them yourself.",
       "input_schema": {
         "type": "object",
         "properties": {
@@ -492,7 +492,7 @@
           },
           "required_revision_id": {
             "type": "string",
-            "description": "Revision ID from google_inspect_document_tables or google_read_document. Required; the call is rejected when the document changed."
+            "description": "Required. Pass the short revision_token (r-...) from google_inspect_document_tables, google_read_document or the previous update; the full revision_id is also accepted but long IDs are easily mis-copied. The call is rejected when the document changed."
           },
           "replace_existing": {
             "type": "boolean",

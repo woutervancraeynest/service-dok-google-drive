@@ -195,6 +195,12 @@ module DocTableCells
       }
     end
 
+    # Everything a cell edit could affect: table shapes, cell texts and
+    # text outside tables. Equal signatures mean no content change.
+    def content_signature(parsed_tabs)
+      [structure_signature(parsed_tabs), cell_texts(parsed_tabs), outside_texts(parsed_tabs)]
+    end
+
     def locate(parsed_tabs, tab_id, table_index, row_index, column_index)
       tab = parsed_tabs.find { |t| t[:tab_id] == tab_id }
       table = tab && tab[:tables][table_index]
@@ -456,12 +462,12 @@ module DocTableCells
       end
     end
 
-    def cell_texts(parsed_tabs, except:)
+    def cell_texts(parsed_tabs, except: nil)
       parsed_tabs.flat_map do |tab|
         tab[:tables].flat_map do |table|
           table[:rows].flat_map do |row|
             row[:cells].filter_map do |cell|
-              skip = tab[:tab_id] == except[:tab_id] && table[:table_index] == except[:table][:table_index] &&
+              skip = except && tab[:tab_id] == except[:tab_id] && table[:table_index] == except[:table][:table_index] &&
                      row[:row_index] == except[:row_index] && cell[:column_index] == except[:column_index]
               [tab[:tab_id], table[:table_index], row[:row_index], cell[:column_index], cell[:text]] unless skip
             end

@@ -95,3 +95,43 @@ RSpec.describe DocTableCells do
     end
   end
 end
+
+RSpec.describe GoogleWorkspace do
+  let(:real) { "AHj4eMSGNXru614YxXcn4jYMrFGnInKn8sMPvmUDPt9Efa7ejUyJucw6serywBGfnXQm0U2yXdRusD8hgeTwY1fXkyxGpp3iw2g3viaSdc28" }
+
+  describe ".revision_token" do
+    it "is short, stable and distinct per revision" do
+      token = described_class.revision_token(real)
+
+      expect(token).to match(/\Ar-[0-9a-f]{12}\z/)
+      expect(described_class.revision_token(real)).to eq(token)
+      expect(described_class.revision_token("#{real}x")).not_to eq(token)
+      expect(described_class.revision_token(nil)).to be_nil
+    end
+  end
+
+  describe ".revision_matches?" do
+    it "accepts the full ID or the token, with surrounding whitespace" do
+      expect(described_class.revision_matches?(real, real)).to be(true)
+      expect(described_class.revision_matches?(" #{described_class.revision_token(real)}\n", real)).to be(true)
+    end
+
+    it "rejects other values" do
+      expect(described_class.revision_matches?(real.delete("2g"), real)).to be(false)
+      expect(described_class.revision_matches?("", real)).to be(false)
+      expect(described_class.revision_matches?("r-000000000000", real)).to be(false)
+    end
+  end
+
+  describe ".likely_miscopied_revision?" do
+    it "detects an ID with the same start and end" do
+      expect(described_class.likely_miscopied_revision?(real.sub("iw2g3", "iw3"), real)).to be(true)
+    end
+
+    it "does not flag equal, unrelated or token values" do
+      expect(described_class.likely_miscopied_revision?(real, real)).to be(false)
+      expect(described_class.likely_miscopied_revision?("rev-0", real)).to be(false)
+      expect(described_class.likely_miscopied_revision?("r-000000000000", real)).to be(false)
+    end
+  end
+end

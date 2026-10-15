@@ -80,6 +80,33 @@ RSpec.describe GoogleWorkspace::Client do
       expect(docs.last_request.write_control.required_revision_id).to eq("revision-1")
     end
 
+    it "returns a revision token when reading a document" do
+      result = client.read_document(file_id: "document")
+
+      expect(result[:revision_token]).to eq(GoogleWorkspace.revision_token("revision-1"))
+    end
+
+    it "resolves a revision token to the full revision ID for writes" do
+      client.update_document(
+        file_id: "document",
+        requests: [{ "insertText" => { "location" => { "index" => 1 }, "text" => "New" } }],
+        required_revision_id: GoogleWorkspace.revision_token("revision-1")
+      )
+
+      expect(docs.last_request.write_control.required_revision_id).to eq("revision-1")
+    end
+
+    it "rejects a stale revision token without writing" do
+      expect do
+        client.update_document(
+          file_id: "document",
+          requests: [{ "insertText" => { "location" => { "index" => 1 }, "text" => "New" } }],
+          required_revision_id: GoogleWorkspace.revision_token("revision-0")
+        )
+      end.to raise_error(GoogleWorkspace::ApiError, /Revision conflict/)
+      expect(docs.last_request).to be_nil
+    end
+
     it "creates a folder in the configured subtree" do
       result = client.create_folder(name: "New folder")
 
@@ -490,6 +517,23 @@ RSpec.describe GoogleWorkspace::Client do
       expect(result[:table_row_index]).to eq(1)
       expect(result[:verification][:row_found]).to be(true)
       expect(fake_docs.batch_requests.length).to eq(1)
+    end
+
+    it "accepts a revision token as required_revision_id" do
+      initial = placeholder_doc(revision_id: "rev-1")
+      final = table_doc(revision_id: "rev-2", data_rows: [["11/09/2026", "Begeleiding SV", "- Actie"]])
+      fake_docs = FakeTableDocs.new([initial, final])
+      c = described_class.new(configuration: { "root_folder_id" => "root" }, oauth_tokens: {},
+                              drive_service: drive, docs_service: fake_docs)
+
+      result = c.append_table_row(
+        file_id: "document", header_cells: LOGBOOK_HEADERS,
+        cells: ["11/09/2026", "Begeleiding SV", "- Actie"],
+        required_revision_id: GoogleWorkspace.revision_token("rev-1")
+      )
+
+      expect(result[:status]).to eq("inserted")
+      expect(result[:revision_token]).to eq(GoogleWorkspace.revision_token("rev-2"))
     end
 
     it "uses text_start_index (not cell boundary) for insertText" do

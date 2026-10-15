@@ -161,6 +161,27 @@ RSpec.describe "Cell-targeted table operations" do
       expect(docs.batch_requests).to be_empty
     end
 
+    it "flags a mis-copied revision ID and suggests the revision token" do
+      real = "AHj4eMSGNXru614YxXcn4jYMrFGnInKn8sMPvmUDPt9Efa7ejUyJucw6serywBGfnXQm0U2yXdRusD8hgeTwY1fXkyxGpp3iw2g3viaSdc28"
+      docs.instance_variable_set(:@revision_id, real)
+      miscopied = real.sub("iw2g3via", "iw3via")
+
+      result = update(required_revision_id: miscopied)
+
+      expect(result).to include(status: "revision_conflict", written: false, phase: "pre_check",
+                                likely_copy_error: true, expected_revision_id: miscopied,
+                                current_revision_id: real, revision_token: GoogleWorkspace.revision_token(real))
+      expect(result[:message]).to include(GoogleWorkspace.revision_token(real))
+      expect(docs.batch_requests).to be_empty
+    end
+
+    it "does not flag a genuinely different revision as a copy error" do
+      result = update(required_revision_id: "rev-0")
+
+      expect(result[:likely_copy_error]).to be_nil
+      expect(result[:message]).to include("changed since it was read")
+    end
+
     it "reports table_not_found with available tables" do
       result = update(table_selector: { "section_heading" => "Verslag" })
 
@@ -426,6 +447,26 @@ RSpec.describe "Cell-targeted table operations" do
     end
   end
 
+  describe "#update_table_cell — revision tokens" do
+    it "returns a short revision token from inspection and accepts it for writes" do
+      token = client.inspect_document_tables(file_id: "doc")[:revision_token]
+
+      expect(token).to match(/\Ar-[0-9a-f]{12}\z/)
+      result = update(required_revision_id: token)
+      expect(result).to include(status: "updated", revision_token: GoogleWorkspace.revision_token(docs.revision_id))
+      expect(docs.batch_requests.first.write_control.required_revision_id).to eq("rev-1")
+    end
+
+    it "rejects a stale revision token" do
+      token = GoogleWorkspace.revision_token(docs.revision_id)
+      docs.set_cell(1, 1, 0, "Iemand anders")
+
+      result = update(required_revision_id: token)
+      expect(result).to include(status: "revision_conflict", written: false, phase: "pre_check")
+      expect(docs.batch_requests).to be_empty
+    end
+  end
+
   describe "#update_table_cell — concurrency and verification" do
     it "reports revision_conflict when the document changes just before the write" do
       docs.concurrent_edit_before_write! { |d| d.set_cell(1, 1, 0, "Menselijke bewerking") }
@@ -444,11 +485,31 @@ RSpec.describe "Cell-targeted table operations" do
       expect(docs.batch_requests.length).to eq(1)
     end
 
-    it "reports write_failed when the write was rejected without document changes" do
-      docs.concurrent_edit_before_write! { raise Google::Apis::ClientError.new("Bad request", status_code: 400) }
+    it "reports write_failed with Google's error when the write was rejected without document changes" do
+      docs.concurrent_edit_before_write! { raise Google::Apis::ClientError.new("Invalid deletion range", status_code: 400) }
+      result = update
+
+      expect(result).to include(status: "write_failed", written: false, phase: "write",
+                                write_error: { status_code: 400, message: "Invalid deletion range" })
+      expect(result[:message]).to include("Invalid deletion range")
+    end
+
+    it "reports write_failed, not a conflict, when only the revision ID changed and the error is unrelated" do
+      docs.concurrent_edit_before_write! do |d|
+        d.set_cell(0, 0, 0, d.cell_text(0, 0, 0))
+        raise Google::Apis::ClientError.new("Invalid deletion range", status_code: 400)
+      end
       result = update
 
       expect(result).to include(status: "write_failed", written: false)
+    end
+
+    it "reports revision_conflict when Google rejects a changed revision without content change" do
+      docs.concurrent_edit_before_write! { |d| d.set_cell(0, 0, 0, d.cell_text(0, 0, 0)) }
+      result = update
+
+      expect(result).to include(status: "revision_conflict", written: false, phase: "write")
+      expect(result[:write_error][:message]).to include("Revision mismatch")
     end
 
     it "reports verification_failed with written: true when the re-read after a successful write fails" do

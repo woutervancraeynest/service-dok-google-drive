@@ -25,6 +25,8 @@ The following operations are not supported:
 
 Google Docs writes use `documents.batchUpdate`. Callers should pass `required_revision_id` from `google_read_document` to prevent stale writes from overwriting human edits.
 
+Every read and write returns `revision_id` and a short `revision_token` (`r-` + 12 hex characters, derived from a SHA-256 of the revision ID). All `required_revision_id` parameters accept either value; agents should pass the token, because Docs revision IDs are about 100 random characters and language models regularly drop or alter characters when copying them. The service resolves the token to the full revision ID and still enforces it through Docs `writeControl`.
+
 Non-folder binary or text files can be read through `google_read_file` with a 5 MB response limit. Google Docs are returned as text through the same tool; use `google_read_document` when the current revision is also required.
 
 ## Table row operations
@@ -54,7 +56,7 @@ The tool returns one of these statuses:
 { "tool": "google_inspect_document_tables", "params": { "file_id": "DOC_ID" } }
 ```
 
-Returns `revision_id` and per table a `table_id` (`t.0/2`), `label`, `section_heading`, `preceding_text` and every cell with `cell_id` (`t.0/2/1/1`), `text` and `state` (`empty`, `placeholder` or `filled`). IDs are positions and only valid for the revision they were inspected at; the mandatory revision check enforces that.
+Returns `revision_id`, `revision_token` and per table a `table_id` (`t.0/2`), `label`, `section_heading`, `preceding_text` and every cell with `cell_id` (`t.0/2/1/1`), `text` and `state` (`empty`, `placeholder` or `filled`). IDs are positions and only valid for the revision they were inspected at; the mandatory revision check enforces that.
 
 ### Fill a cell by row label and column header
 
@@ -67,13 +69,13 @@ Returns `revision_id` and per table a `table_id` (`t.0/2`), `label`, `section_he
     "row_selector": { "cell_text": "Opstartgesprek" },
     "column_selector": { "header_text": "Datum" },
     "value": "09/10/2026",
-    "required_revision_id": "REVISION_FROM_INSPECT",
+    "required_revision_id": "r-3fa9c01b7d2e",
     "dry_run": true
   }
 }
 ```
 
-Repeat without `dry_run`, then for `"header_text": "Aanwezigen"` using the `revision_id` returned by the previous update.
+Repeat without `dry_run`, then for `"header_text": "Aanwezigen"` using the `revision_token` returned by the previous update.
 
 - `table_selector` (optional, all keys must match): `table_id`, `header_cells` (complete texts of one row), `section_heading` (nearest heading above the table, the paragraph directly above it, or the first cell), `contains_text` (exact text of any cell).
 - `row_selector`: `cell_text` matched against column `column_index` (default 0), or `row_index` (requires a `table_selector`).
@@ -90,7 +92,7 @@ Use an anchor cell and a relation (`right`, `below`, or `next` = right, else fir
   "table_selector": { "section_heading": "Doelstellingen" },
   "cell_selector": { "anchor_text": "Doelstellingen", "relation": "below" },
   "value": "Leest vlot een korte tekst.",
-  "required_revision_id": "..."
+  "required_revision_id": "r-3fa9c01b7d2e"
 }
 ```
 
@@ -100,7 +102,8 @@ Or use `"cell_selector": { "cell_id": "t.0/4/1/0" }` from the inspection.
 
 - Only an existing cell is changed; rows are never inserted.
 - Empty cells, filler (`___`, `…`), `<token>` placeholders and Word placeholders such as "Klik of tik om een datum in te voeren." may be filled. Extra placeholder texts can be passed with `placeholders`. Other content, smart chips (date, person) included, is only overwritten with `replace_existing: true`. Cells with nested tables or open suggestions (suggested insertions/deletions) are never edited; inspection marks the latter with `has_suggestions: true`.
-- `required_revision_id` is mandatory. The revision is checked before resolving and enforced again by Docs `writeControl` during the write.
+- `required_revision_id` (token or full ID) is mandatory. The revision is checked before resolving and enforced again by Docs `writeControl` during the write.
+- After a rejected write the service compares the document content before and after, not only the revision ID (Google may change the ID without a content change). Unchanged content means `write_failed`, unless Google reports a revision error; Google's error is returned in `write_error` and logged to stderr.
 - The write is a single `batchUpdate` without automatic retries. Afterwards the service re-reads the document and verifies that the target cell holds the value, that the table structure is unchanged, and that no other cell or text outside tables changed.
 
 ### Result
@@ -121,6 +124,7 @@ Or use `"cell_selector": { "cell_id": "t.0/4/1/0" }` from the inspection.
   "old_value": "Klik of tik om een datum in te voeren.",
   "new_value": "09/10/2026",
   "revision_id": "...",
+  "revision_token": "r-...",
   "verification": { "ok": true, "checks": { "...": true }, "problems": [] }
 }
 ```
@@ -135,9 +139,9 @@ Or use `"cell_selector": { "cell_id": "t.0/4/1/0" }` from the inspection.
 | `ambiguous_match` | Several cells match; `candidates` helps refine the selector. | no |
 | `cell_not_empty` | Meaningful content present and `replace_existing` not set. | no |
 | `unsupported_cell_content` | Cell contains a nested table or open suggestions. | no |
-| `revision_conflict` | Document changed; `revision_id` is the current revision. | no |
+| `revision_conflict` | Document changed; `revision_id`/`revision_token` are current. `phase` is `pre_check` or `write`. A pre-check conflict includes `expected_revision_id` and `current_revision_id`, and `likely_copy_error: true` when the supplied ID looks like a mis-copied current ID. | no |
 | `invalid_selector` / `invalid_request` | Invalid parameters. | no |
-| `write_failed` | Google rejected the write; the document is unchanged. | no |
+| `write_failed` | Google rejected the write; the document is unchanged. `write_error` holds Google's status code and message. | no |
 | `verification_failed` | Written, but verification found a problem (see `verification`). Also returned (with `revision_id: null`) when the document cannot be re-read after the write. `written` is `"unknown"` when the outcome is unclear, e.g. a concurrent edit or a failed write response followed by a failed re-read. | yes / unknown |
 
 Inserted text inherits the formatting at the insertion point. When a grey Word placeholder is replaced, check the formatting in the document.

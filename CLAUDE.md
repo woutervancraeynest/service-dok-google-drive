@@ -11,6 +11,7 @@ This repository contains a Dok Service that exposes Google Drive and Google Docs
 - Use Google Drive API for file and folder operations.
 - Use Google Docs API `batchUpdate` for document content changes.
 - Require a revision ID for agent edits whenever one was returned by a preceding read.
+- Every result that carries `revision_id` also carries `revision_token` (`GoogleWorkspace.revision_token`). Every `required_revision_id` parameter must accept both via `GoogleWorkspace.revision_matches?`; the token is resolved to the full ID before it is sent to Docs `writeControl`.
 - Keep API responses bounded; do not return unbounded Drive listings or exports.
 - Agents must never compute Google Docs indices. Use `google_append_table_row` to add rows and `google_update_table_cell` to fill existing cells; both compute all structural indices server-side.
 - `google_update_table_cell` must never insert rows, overwrite meaningful content without `replace_existing`, or write when selectors are ambiguous or the revision is stale. Every write is verified by re-reading the document.
