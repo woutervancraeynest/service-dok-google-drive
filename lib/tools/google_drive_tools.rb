@@ -162,4 +162,39 @@ module Tools
       end
     end
   end
+
+  class InspectDocumentTables
+    extend GoogleAuth
+
+    def self.call(params:, context:)
+      with_google_client(context) do |client|
+        client.inspect_document_tables(
+          file_id: params["file_id"],
+          table_selector: params["table_selector"],
+          placeholders: params.fetch("placeholders", [])
+        )
+      end
+    end
+  end
+
+  class UpdateTableCell
+    extend GoogleAuth
+
+    def self.call(params:, context:)
+      with_google_client(context) do |client|
+        client.update_table_cell(
+          file_id: params["file_id"],
+          value: params["value"],
+          required_revision_id: params["required_revision_id"],
+          table_selector: params["table_selector"],
+          row_selector: params["row_selector"],
+          column_selector: params["column_selector"],
+          cell_selector: params["cell_selector"],
+          replace_existing: params.fetch("replace_existing", false) == true,
+          dry_run: params.fetch("dry_run", false) == true,
+          placeholders: params.fetch("placeholders", [])
+        )
+      end
+    end
+  end
 end

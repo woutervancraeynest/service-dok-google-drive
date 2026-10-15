@@ -59,3 +59,9 @@ The service does not manage Google Drive sharing or permissions. Humans must per
 - `google_move_file`
 - `google_delete_file`
 - `google_export_file`
+- `google_append_table_row`
+- `google_analyze_document_tables`
+- `google_inspect_document_tables`
+- `google_update_table_cell`
+
+See `SERVICE_SPEC.md` for table cell editing examples.

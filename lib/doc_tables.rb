@@ -7,6 +7,11 @@
 module DocTables
   DATE_PATTERN = /\b\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{4}\b/.freeze
   PLACEHOLDER_TOKEN = /\A<[^>]+>\z/.freeze
+  HEADING_STYLES = /\A(HEADING_\d|TITLE|SUBTITLE)\z/.freeze
+  RICH_ELEMENT_KINDS = %i[
+    auto_text date_element equation footnote_reference horizontal_rule
+    inline_object_element person rich_link
+  ].freeze
 
   class << self
     # ── Parsing ────────────────────────────────────────────────────────
@@ -215,14 +220,22 @@ module DocTables
     def parse_body_content(tab_id, elements)
       tables = []
       outside_paragraphs = []
+      last_heading = nil
+      last_paragraph = nil
 
       elements.each do |element|
         if element.respond_to?(:table) && element.table
-          tables << parse_table_element(element)
+          table = parse_table_element(element)
+          table[:table_index] = tables.length
+          table[:section_heading] = last_heading
+          table[:preceding_text] = last_paragraph
+          tables << table
         elsif element.respond_to?(:paragraph) && element.paragraph
           text = paragraph_text(element.paragraph)
           next if text.strip.empty?
 
+          last_paragraph = text.strip
+          last_heading = text.strip if heading_paragraph?(element.paragraph)
           outside_paragraphs << {
             text: text,
             start_index: element.start_index,
@@ -245,7 +258,10 @@ module DocTables
             end_index: cell.end_index,
             text_start_index: content_elements.first&.start_index || cell.start_index + 1,
             text_end_index: content_elements.last&.end_index || cell.end_index,
-            text: cell_text(cell)
+            text: cell_text(cell),
+            nested_table: content_elements.any? { |el| el.respond_to?(:table) && el.table },
+            rich_elements: rich_element_count(content_elements),
+            suggestions: suggestions?(cell, content_elements)
           }
         end
         { row_index: row_idx, cells: cells }
@@ -271,6 +287,46 @@ module DocTables
       return "" unless paragraph
 
       Array(paragraph.elements).filter_map { |el| el.text_run&.content }.join
+    end
+
+    def heading_paragraph?(paragraph)
+      style = paragraph.respond_to?(:paragraph_style) ? paragraph.paragraph_style : nil
+      style_type = style.respond_to?(:named_style_type) ? style.named_style_type : nil
+      style_type.to_s.match?(HEADING_STYLES)
+    end
+
+    # Counts non-text paragraph elements (date chips, people, images, ...).
+    # They carry meaning even when the cell has no text runs.
+    # True when the cell or its content carries open suggested insertions
+    # or deletions. Their text shows up inline, so it must not be edited.
+    def suggestions?(cell, content_elements)
+      return true if suggested?(cell)
+
+      content_elements.any? do |el|
+        next false unless el.respond_to?(:paragraph) && el.paragraph
+
+        Array(el.paragraph.elements).any? do |item|
+          ([:text_run] + RICH_ELEMENT_KINDS).any? do |kind|
+            item.respond_to?(kind) && (value = item.public_send(kind)) && suggested?(value)
+          end
+        end
+      end
+    end
+
+    def suggested?(object)
+      %i[suggested_insertion_ids suggested_deletion_ids].any? do |key|
+        object.respond_to?(key) && Array(object.public_send(key)).any?
+      end
+    end
+
+    def rich_element_count(content_elements)
+      content_elements.sum do |el|
+        next 0 unless el.respond_to?(:paragraph) && el.paragraph
+
+        Array(el.paragraph.elements).count do |item|
+          RICH_ELEMENT_KINDS.any? { |kind| item.respond_to?(kind) && item.public_send(kind) }
+        end
+      end
     end
 
     def normalize_header(text)

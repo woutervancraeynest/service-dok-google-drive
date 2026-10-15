@@ -350,6 +350,171 @@
         "destructive_hint": false,
         "idempotent_hint": true
       }
+    },
+    {
+      "name": "google_inspect_document_tables",
+      "description": "Inspect all tables of a Google Docs document cell by cell. Returns per table a stable table_id, label and section heading, and per cell a stable cell_id, its text and its state (empty, placeholder or filled). Use this before google_update_table_cell. No Docs indices are returned; never compute them yourself.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file_id": {
+            "type": "string",
+            "description": "Google Drive file ID of the Google Docs document."
+          },
+          "table_selector": {
+            "type": "object",
+            "description": "Optional filters to identify the table. All given keys must match. The full selector set must resolve to exactly one cell.",
+            "properties": {
+              "table_id": {
+                "type": "string",
+                "description": "Stable table ID from google_inspect_document_tables, e.g. 't.0/2'. Only valid for the revision it was inspected at."
+              },
+              "header_cells": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Complete ordered texts of one table row (usually the header row)."
+              },
+              "section_heading": {
+                "type": "string",
+                "description": "Section title of the table: the nearest heading above it, the paragraph directly above it, or the text of its first cell."
+              },
+              "contains_text": {
+                "type": "string",
+                "description": "Exact text of any cell in the table."
+              }
+            }
+          },
+          "placeholders": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Extra placeholder texts that count as empty, in addition to the built-in Word placeholders (e.g. 'Klik of tik om een datum in te voeren.') and <token> placeholders."
+          }
+        },
+        "required": ["file_id"]
+      },
+      "annotations": {
+        "read_only_hint": true,
+        "destructive_hint": false,
+        "idempotent_hint": true
+      }
+    },
+    {
+      "name": "google_update_table_cell",
+      "description": "Fill one existing cell of a table in a Google Docs document. Select the cell with row_selector + column_selector (row label and column header), or with cell_selector (cell_id from google_inspect_document_tables, or anchor text plus relation). The service resolves the structure and computes all indices. It never adds rows, never overwrites meaningful content unless replace_existing is true, refuses ambiguous selectors, requires the current revision, and verifies the cell after writing. Any status other than 'updated' means nothing was written unless the result says written: true.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file_id": {
+            "type": "string",
+            "description": "Google Drive file ID of the Google Docs document."
+          },
+          "table_selector": {
+            "type": "object",
+            "description": "Optional filters to identify the table. All given keys must match. The full selector set must resolve to exactly one cell.",
+            "properties": {
+              "table_id": {
+                "type": "string",
+                "description": "Stable table ID from google_inspect_document_tables, e.g. 't.0/2'. Only valid for the revision it was inspected at."
+              },
+              "header_cells": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Complete ordered texts of one table row (usually the header row)."
+              },
+              "section_heading": {
+                "type": "string",
+                "description": "Section title of the table: the nearest heading above it, the paragraph directly above it, or the text of its first cell."
+              },
+              "contains_text": {
+                "type": "string",
+                "description": "Exact text of any cell in the table."
+              }
+            }
+          },
+          "row_selector": {
+            "type": "object",
+            "description": "Selects the row. Use with column_selector.",
+            "properties": {
+              "cell_text": {
+                "type": "string",
+                "description": "Exact label of the row (case-insensitive, whitespace and trailing colon ignored), e.g. 'Opstartgesprek'."
+              },
+              "column_index": {
+                "type": "integer",
+                "description": "Zero-based column that holds the row label. Default 0."
+              },
+              "row_index": {
+                "type": "integer",
+                "description": "Zero-based row index from google_inspect_document_tables. Requires a table_selector."
+              }
+            }
+          },
+          "column_selector": {
+            "type": "object",
+            "description": "Selects the column within the selected row.",
+            "properties": {
+              "header_text": {
+                "type": "string",
+                "description": "Column header text, e.g. 'Datum'. Searched in the rows above the target row, nearest first."
+              },
+              "header_row_index": {
+                "type": "integer",
+                "description": "Optional zero-based row index that holds the column headers."
+              },
+              "index": {
+                "type": "integer",
+                "description": "Zero-based column index. When combined with header_text, both must agree."
+              }
+            }
+          },
+          "cell_selector": {
+            "type": "object",
+            "description": "Alternative to row_selector + column_selector, e.g. for tables without column headers.",
+            "properties": {
+              "cell_id": {
+                "type": "string",
+                "description": "Stable cell ID from google_inspect_document_tables, e.g. 't.0/2/1/1'. Only valid for the inspected revision."
+              },
+              "anchor_text": {
+                "type": "string",
+                "description": "Exact text of a label cell, e.g. 'Doelstellingen'. Must occur exactly once in the selected tables."
+              },
+              "relation": {
+                "type": "string",
+                "enum": ["next", "right", "below"],
+                "description": "Target cell relative to the anchor: 'right' (same row), 'below' (same column, next row) or 'next' (right, otherwise first cell of the next row). Default 'next'."
+              }
+            }
+          },
+          "value": {
+            "type": "string",
+            "description": "Text to write into the cell, verbatim."
+          },
+          "required_revision_id": {
+            "type": "string",
+            "description": "Revision ID from google_inspect_document_tables or google_read_document. Required; the call is rejected when the document changed."
+          },
+          "replace_existing": {
+            "type": "boolean",
+            "description": "Allow overwriting a cell with meaningful content. Default false; empty cells and placeholders are always fillable."
+          },
+          "dry_run": {
+            "type": "boolean",
+            "description": "When true, resolve and check everything and return the selected cell, its current content and the planned value without writing. Default false."
+          },
+          "placeholders": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Extra placeholder texts that count as empty, in addition to the built-in Word placeholders (e.g. 'Klik of tik om een datum in te voeren.') and <token> placeholders."
+          }
+        },
+        "required": ["file_id", "value", "required_revision_id"]
+      },
+      "annotations": {
+        "read_only_hint": false,
+        "destructive_hint": false,
+        "idempotent_hint": true
+      }
     }
   ],
   "oauth": {

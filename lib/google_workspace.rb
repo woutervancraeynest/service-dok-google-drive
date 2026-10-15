@@ -6,6 +6,7 @@ require "stringio"
 require "time"
 require "uri"
 require_relative "doc_tables"
+require_relative "doc_table_cells"
 
 module GoogleWorkspace
   # C1: drive.file only covers files the app created or user selected via Picker.
@@ -22,6 +23,7 @@ module GoogleWorkspace
   MAX_SEARCH_FOLDERS = 50
   MAX_RETRIES = 2
   MAX_APPEND_ATTEMPTS = 2
+  MAX_INSPECT_TABLES = 50
   FILE_FIELDS = "id,name,mimeType,parents,trashed,webViewLink,modifiedTime,size,shortcutDetails(targetId,targetMimeType),driveId".freeze
 
   class Error < StandardError; end
@@ -491,7 +493,147 @@ module GoogleWorkspace
       analysis
     end
 
+    # ── Cell-targeted table operations ───────────────────────────────
+
+    def inspect_document_tables(file_id:, table_selector: nil, placeholders: [])
+      file = resolve_file_in_scope!(file_id)
+      unless file.mime_type == DOCUMENT_MIME_TYPE
+        raise ConfigurationError, "Only Google Docs documents can be inspected."
+      end
+
+      doc = get_structured_document(file.id)
+      tables = DocTableCells.inspect_tables(
+        DocTables.parse(doc), table_selector: table_selector, placeholders: Array(placeholders)
+      )
+
+      {
+        id: file.id,
+        name: file.name,
+        revision_id: doc.revision_id,
+        table_count: tables.length,
+        tables: tables.first(MAX_INSPECT_TABLES),
+        truncated: tables.length > MAX_INSPECT_TABLES
+      }
+    end
+
+    # Fills exactly one existing table cell. Every non-"updated" status
+    # means nothing was written, unless the result says written: true.
+    def update_table_cell(file_id:, value:, required_revision_id:, table_selector: nil, row_selector: nil,
+                          column_selector: nil, cell_selector: nil, replace_existing: false,
+                          dry_run: false, placeholders: [])
+      file = resolve_file_in_scope!(file_id)
+      unless file.mime_type == DOCUMENT_MIME_TYPE
+        raise ConfigurationError, "Only Google Docs documents support table operations."
+      end
+
+      required_revision_id = required_revision_id.to_s.strip
+      if required_revision_id.empty?
+        return cell_result("invalid_request", file, nil,
+                           message: "required_revision_id is required. Read or inspect the document first.")
+      end
+      unless value.is_a?(String) && !DocTableCells.clean_value(value).empty?
+        return cell_result("invalid_request", file, nil, message: "value must be a non-empty string.")
+      end
+      value = value.gsub("\r\n", "\n")
+
+      doc0 = get_structured_document(file.id)
+      rev0 = doc0.revision_id
+      if required_revision_id != rev0
+        return cell_result("revision_conflict", file, rev0,
+                           message: "The document changed since it was read. Inspect it again.")
+      end
+
+      parsed0 = DocTables.parse(doc0)
+      resolution = DocTableCells.resolve(
+        parsed0,
+        table_selector: table_selector, row_selector: row_selector,
+        column_selector: column_selector, cell_selector: cell_selector
+      )
+      unless resolution[:status] == "resolved"
+        return cell_result(resolution[:status], file, rev0, **resolution.except(:status))
+      end
+
+      target = resolution[:target]
+      cell = target[:cell]
+      old_value = DocTableCells.clean_value(cell[:text])
+      state = DocTableCells.cell_state(cell, placeholders: Array(placeholders))
+      details = DocTableCells.describe_target(target).except(:current_value)
+                             .merge(old_value: old_value, new_value: value, cell_state: state)
+
+      if cell[:nested_table]
+        return cell_result("unsupported_cell_content", file, rev0, **details,
+                           message: "The target cell contains a nested table.")
+      end
+      if cell[:suggestions]
+        return cell_result("unsupported_cell_content", file, rev0, **details,
+                           message: "The target cell contains open suggestions. Accept or reject them first.")
+      end
+      if old_value == DocTableCells.clean_value(value) && cell[:rich_elements].to_i.zero?
+        return cell_result("unchanged", file, rev0, **details, message: "The cell already contains this value.")
+      end
+      if state == "filled" && !replace_existing
+        return cell_result("cell_not_empty", file, rev0, **details,
+                           message: "The target cell already has content. Pass replace_existing: true to overwrite.")
+      end
+      return cell_result("would_update", file, rev0, **details, dry_run: true) if dry_run
+
+      requests = build_cell_fill_requests(target[:tab_id], [cell], [value], clear: true)
+      write_error = attempt_batch_update(file.id, build_guarded_batch(requests, rev0))
+
+      begin
+        doc1 = get_structured_document(file.id)
+      rescue ApiError, AuthenticationError => e
+        return cell_result("verification_failed", file, nil, written: write_error.nil? ? true : "unknown", **details,
+                           message: "The document could not be re-read after the write (#{e.class.name.split('::').last}). " \
+                                    "Inspect the cell before retrying.")
+      end
+      rev1 = doc1.revision_id
+      verification = DocTableCells.verify_update(parsed0, DocTables.parse(doc1), target, value)
+
+      if write_error.nil?
+        status = verification[:ok] ? "updated" : "verification_failed"
+        return cell_result(status, file, rev1, written: true, **details, verification: verification)
+      end
+
+      if rev1 == rev0
+        return cell_result("write_failed", file, rev1, **details,
+                           message: "Google Docs rejected the update (#{api_error_code(write_error)}).")
+      end
+      if verification[:ok]
+        return cell_result("updated", file, rev1, written: true, **details, verification: verification)
+      end
+
+      current = DocTableCells.locate(DocTables.parse(doc1), target[:tab_id], target[:table][:table_index],
+                                     target[:row_index], target[:column_index])
+      if current && DocTableCells.clean_value(current[:text]) == old_value
+        return cell_result("revision_conflict", file, rev1, **details,
+                           message: "The document changed concurrently; the update was not applied.")
+      end
+
+      cell_result("verification_failed", file, rev1, written: "unknown", **details, verification: verification,
+                  message: "The document changed concurrently; inspect the cell before retrying.")
+    end
+
     private
+
+    # Single attempt without retries: a retried write could apply twice or
+    # be misreported. The caller re-reads the document to learn the outcome.
+    def attempt_batch_update(file_id, batch_request)
+      @docs.batch_update_document(file_id, batch_request)
+      nil
+    rescue Google::Apis::AuthorizationError
+      raise AuthenticationError
+    rescue Google::Apis::Error => e
+      e
+    end
+
+    def api_error_code(error)
+      error.respond_to?(:status_code) && error.status_code ? error.status_code : error.class.name.split("::").last
+    end
+
+    def cell_result(status, file, revision_id, written: false, **extra)
+      { status: status, file_id: file.id, written: written, revision_id: revision_id }.merge(extra.compact)
+    end
 
     def read_document_internal(file)
       unless file.mime_type == DOCUMENT_MIME_TYPE

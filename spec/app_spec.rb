@@ -60,5 +60,45 @@ RSpec.describe DokService do
       expect(last_response.status).to eq(200)
       expect(JSON.parse(last_response.body)["id"]).to eq("doc1")
     end
+
+    it "dispatches google_inspect_document_tables" do
+      client = instance_double(GoogleWorkspace::Client)
+      allow(GoogleWorkspace::Client).to receive(:from_context).and_return(client)
+      allow(client).to receive(:inspect_document_tables).and_return({ id: "doc1", tables: [] })
+
+      call_tool("google_inspect_document_tables", params: { "file_id" => "doc1" })
+
+      expect(client).to have_received(:inspect_document_tables)
+        .with(file_id: "doc1", table_selector: nil, placeholders: [])
+      expect(JSON.parse(last_response.body)["id"]).to eq("doc1")
+    end
+
+    it "dispatches google_update_table_cell with strict boolean flags" do
+      client = instance_double(GoogleWorkspace::Client)
+      allow(GoogleWorkspace::Client).to receive(:from_context).and_return(client)
+      allow(client).to receive(:update_table_cell).and_return({ status: "would_update" })
+
+      call_tool("google_update_table_cell", params: {
+        "file_id" => "doc1",
+        "value" => "09/10/2026",
+        "required_revision_id" => "rev-1",
+        "row_selector" => { "cell_text" => "Opstartgesprek" },
+        "column_selector" => { "header_text" => "Datum" },
+        "replace_existing" => "true",
+        "dry_run" => true
+      })
+
+      expect(client).to have_received(:update_table_cell).with(hash_including(
+        file_id: "doc1", value: "09/10/2026", required_revision_id: "rev-1",
+        row_selector: { "cell_text" => "Opstartgesprek" }, replace_existing: false, dry_run: true
+      ))
+      expect(JSON.parse(last_response.body)["status"]).to eq("would_update")
+    end
+
+    it "lists every dispatched tool in the manifest" do
+      manifest = JSON.parse(File.read(File.expand_path("../manifest.json", __dir__)))
+
+      expect(manifest["tools"].map { |t| t["name"] }).to match_array(DokService::TOOLS.keys)
+    end
   end
 end
